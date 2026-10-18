@@ -96,8 +96,36 @@ def test_empty_route_rejected(open_grid):
     assert codes([], open_grid) == {V.EMPTY_ROUTE}
 
 
-def test_huge_route_rejected_without_checking_each_cell(open_grid):
-    assert codes([[0, 0]] * 100_000, open_grid) == {V.MALFORMED}
+def test_absurdly_long_input_refused(open_grid):
+    assert codes([[0, 0]] * 100_001, open_grid) == {V.MALFORMED}
+
+
+def test_long_but_wellformed_route_is_over_budget(open_grid):
+    assert V.BUDGET_EXCEEDED in codes(GOOD + GOOD[1:] * 10, open_grid)
+
+
+def test_cell_both_obstacle_and_restricted_reports_both():
+    c = make_constraints(obstacles=[(2, 0)], restricted=[(2, 0)])
+    assert {V.OBSTACLE, V.RESTRICTED_ZONE} <= codes(GOOD, c)
+
+
+def test_missing_destination_still_reports_wrong_ending(open_grid):
+    route = [[0, 0], [1, 0], [1, 1]]
+    assert {V.DESTINATION_NOT_REACHED, V.NOT_RETURNED_TO_BASE} <= codes(route, open_grid)
+
+
+def test_unsafe_and_mission_invalid_classification(open_grid, walled_grid):
+    assert validate_route(GOOD, walled_grid).unsafe            # through restricted cells
+    short = validate_route(GOOD[:3] + [[1, 0], [0, 0]], open_grid)
+    assert short.mission_invalid and not short.unsafe           # safe but never reaches (3, 0)
+    assert not validate_route(GOOD, open_grid).unsafe
+
+
+def test_swept_cells_x_then_y():
+    from app.safety_shield import swept_cells
+    assert swept_cells((0, 0), (2, 2)) == [(1, 0), (2, 0), (2, 1)]
+    assert swept_cells((0, 0), (1, 0)) == []
+    assert swept_cells((3, 3), (3, 3)) == []
 
 
 def test_reports_all_violations_not_just_first(walled_grid):

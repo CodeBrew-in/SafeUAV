@@ -7,9 +7,9 @@ ignored. Route validity is decided by the safety shield alone.
 
 from __future__ import annotations
 
+import http.client
 import json
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable
@@ -136,6 +136,8 @@ def parse_response(text: str) -> ParsedResponse:
 
 @dataclass
 class LLMProposal:
+    """What the planner returned. Also used for scripted test fixtures (model="scripted")."""
+
     model: str
     status: str | None              # "route_proposed", "infeasible" or None on failure
     waypoints: object | None
@@ -143,6 +145,7 @@ class LLMProposal:
     latency_ms: float
     attempts: int
     raw_responses: list[str] = field(default_factory=list)
+    attempt_log: list[dict] = field(default_factory=list)  # per attempt: temperature, seed, outcome
     parse_error: str | None = None
     transport_error: str | None = None
 
@@ -156,6 +159,7 @@ class LLMProposal:
             "status": self.status,
             "reason": self.reason,
             "attempts": self.attempts,
+            "attempt_log": self.attempt_log,
             "latency_ms": round(self.latency_ms, 1),
             "parse_error": self.parse_error,
             "transport_error": self.transport_error,
@@ -176,7 +180,7 @@ def http_post_json(url: str, payload: dict, timeout: float) -> dict:
 class OllamaPlanner:
     def __init__(self, model: str = DEFAULT_MODEL, host: str = DEFAULT_HOST, *, timeout_s: float = 120.0,
                  max_attempts: int = 2, temperature: float = 0.0, retry_temperature: float = 0.4,
-                 seed: int | None = 0, max_tokens: int = 1500, transport: Transport = http_post_json):
+                 seed: int | None = 0, max_tokens: int = 2048, transport: Transport = http_post_json):
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         self.model = model
@@ -190,17 +194,20 @@ class OllamaPlanner:
         self.transport = transport
 
     def token_limit(self, ctx: MissionContext) -> int:
-        # About 8 tokens per "[x, y], " waypoint, plus room for status and reason. A model
-        # that degenerates into listing cells forever is cut off soon after the budget.
-        return min(self.max_tokens, (ctx.constraints.max_steps + 1) * 10 + 200)
+        # Measured on qwen2.5:3b: a compact "[10, 2], " waypoint is about 7 tokens. Allow
+        # 20 per waypoint so pretty-printed JSON of a full-budget route still fits, while a
+        # model stuck listing cells forever is cut off instead of running for minutes.
+        # Cut-offs are recorded (done_reason "length") so they can be counted.
+        return max(600, min(self.max_tokens, (ctx.constraints.max_steps + 1) * 20 + 300))
 
-    def _payload(self, ctx: MissionContext, attempt: int = 0) -> dict:
+    def _payload(self, ctx: MissionContext, attempt: int = 0, seed: int | None = None) -> dict:
         # At temperature 0 decoding is greedy and a retry would repeat the same output,
         # so retries sample at retry_temperature with a different (still fixed) seed.
         temperature = self.temperature if attempt == 0 else max(self.temperature, self.retry_temperature)
         options = {"temperature": temperature, "num_predict": self.token_limit(ctx)}
-        if self.seed is not None:
-            options["seed"] = self.seed + attempt
+        base_seed = self.seed if seed is None else seed
+        if base_seed is not None:
+            options["seed"] = base_seed + attempt
         return {
             "model": self.model,
             "stream": False,
@@ -220,22 +227,42 @@ class OllamaPlanner:
             return False
         return any(m.get("name") == self.model for m in tags.get("models", []))
 
-    def propose(self, ctx: MissionContext) -> LLMProposal:
-        """Ask the model for a route. Retries only on unparseable output, up to max_attempts."""
+    def propose(self, ctx: MissionContext, seed: int | None = None) -> LLMProposal:
+        """Ask the model for a route. Retries only on unparseable output, up to max_attempts.
+
+        ``seed`` overrides the planner's default seed, so repeated draws of one
+        scenario can be requested with seeds 0, 1, 2, ...
+        """
         prop = LLMProposal(self.model, None, None, None, 0.0, 0)
         t0 = time.perf_counter()
         for attempt in range(self.max_attempts):
             prop.attempts += 1
+            payload = self._payload(ctx, attempt, seed)
+            record = {"attempt": attempt + 1, "temperature": payload["options"]["temperature"],
+                      "seed": payload["options"].get("seed"), "num_predict": payload["options"]["num_predict"]}
+            prop.attempt_log.append(record)
+            ta = time.perf_counter()
             try:
-                data = self.transport(f"{self.host}/api/chat", self._payload(ctx, attempt), self.timeout_s)
-            except (OSError, urllib.error.URLError, ValueError) as e:
+                data = self.transport(f"{self.host}/api/chat", payload, self.timeout_s)
+                if not isinstance(data, dict):
+                    raise ValueError(f"server returned {type(data).__name__}, expected a JSON object")
+                if "error" in data:
+                    raise ValueError(f"server error: {data['error']}"[:300])
+            except (OSError, ValueError, http.client.HTTPException) as e:
+                # URLError, timeouts and dropped connections are OSError; IncompleteRead is an
+                # HTTPException. A dead or failing server is not retried.
                 prop.transport_error = f"{type(e).__name__}: {e}"[:500]
-                break  # a dead or timed-out server is not retried
-            text = str((data.get("message") or {}).get("content", ""))
+                record.update(outcome="transport_error", latency_ms=round((time.perf_counter() - ta) * 1000, 1))
+                break
+            message = data.get("message")
+            text = str(message.get("content", "")) if isinstance(message, dict) else ""
             prop.raw_responses.append(text[:MAX_RAW_CHARS])
             parsed = parse_response(text)
             if not parsed.ok and data.get("done_reason") == "length":
                 parsed = ParsedResponse(None, None, None, f"output cut off at the token limit; {parsed.error}")
+            record.update(done_reason=data.get("done_reason"), eval_tokens=data.get("eval_count"),
+                          latency_ms=round((time.perf_counter() - ta) * 1000, 1),
+                          outcome="parsed" if parsed.ok else "parse_error")
             if parsed.ok:
                 prop.status, prop.waypoints, prop.reason = parsed.status, parsed.waypoints, parsed.reason
                 prop.parse_error = None
@@ -243,3 +270,13 @@ class OllamaPlanner:
             prop.parse_error = parsed.error
         prop.latency_ms = (time.perf_counter() - t0) * 1000
         return prop
+
+
+def scripted_proposal(waypoints: object = None, *, status: str | None = "route_proposed",
+                      reason: str | None = "scripted test fixture", parse_error: str | None = None,
+                      transport_error: str | None = None) -> LLMProposal:
+    """A hand-written proposal, clearly labelled as not coming from a model."""
+    if parse_error or transport_error:
+        status = None
+    return LLMProposal("scripted", status, waypoints if status == "route_proposed" else None, reason,
+                       0.0, 0, parse_error=parse_error, transport_error=transport_error)

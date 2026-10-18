@@ -1,67 +1,59 @@
-"""Run every demo scenario through all three methods with the live local model and print what happened.
+"""Run every demo scenario through all methods with the live local model and save every run.
+
+Each (scenario, seed) gets ONE model call, scored under llm_only, llm_shield and
+llm_shield_no_fallback (paired design). A* runs once per scenario (it is deterministic).
+Records go to a JSONL file; the summary table is then printed FROM that file.
 
 Usage (from the repo root):
-    .venv/Scripts/python experiments/try_llm.py [--model qwen2.5:3b] [--json out.json]
+    .venv/Scripts/python experiments/try_llm.py [--model qwen2.5:3b] [--seeds 3] [--out results/demo_runs.jsonl]
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import sys
-from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "backend"))
+sys.path.insert(0, str(ROOT / "experiments"))
 
 from app.llm_planner import DEFAULT_MODEL, OllamaPlanner  # noqa: E402
 from app.mission import build_mission  # noqa: E402
-from app.runner import Method, run_astar, run_llm  # noqa: E402
+from app.records import append_jsonl, environment, to_record  # noqa: E402
+from app.runner import run_astar, run_llm_arms  # noqa: E402
 from app.scenarios import load_scenarios  # noqa: E402
+from summarize_runs import print_summary  # noqa: E402
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=DEFAULT_MODEL)
-    ap.add_argument("--json", type=Path, help="also save full run records here")
+    ap.add_argument("--seeds", type=int, default=1, help="number of draws per scenario (seeds 0..N-1)")
+    ap.add_argument("--out", type=Path,
+                    default=ROOT / "results" / f"demo_runs_{datetime.now():%Y%m%d_%H%M%S}.jsonl")
     args = ap.parse_args()
 
     planner = OllamaPlanner(model=args.model)
     if not planner.is_available():
         print(f"Ollama is not running or model {args.model} is not installed.", file=sys.stderr)
         return 1
+    env = environment(args.model, planner.host)
+    print(f"model={args.model} ollama={env['ollama_version']} gpu={env['gpu']} commit={env['git_commit']}")
 
-    records = []
-    print(f"{'scenario':<20} {'method':<11} {'status':<24} {'proposal':<10} {'steps':>5} {'llm s':>6}  reason")
     for s in load_scenarios().values():
         ctx = build_mission(s)
-        for method in Method:
-            r = run_astar(ctx) if method is Method.ASTAR else run_llm(ctx, method, planner)
-            v = r.proposal_validation
-            if method is Method.ASTAR:
-                proposal = "-"
-            elif r.llm and r.llm["status"] == "infeasible":
-                proposal = "infeasible"
-            elif r.llm and (r.llm["parse_error"] or r.llm["transport_error"]):
-                proposal = "no route"
-            else:
-                proposal = "valid" if v and v.valid else "invalid"
-            steps = len(r.executed_trail) - 1 if r.executed_trail else "-"
-            llm_s = f"{r.proposal_latency_ms / 1000:.1f}" if r.proposal_latency_ms else "-"
-            llm = r.llm or {}
-            if llm.get("parse_error") or llm.get("transport_error"):
-                why = llm.get("parse_error") or llm.get("transport_error")
-            elif v and not v.valid:
-                why = v.reason
-            else:
-                why = llm.get("reason") or ""
-            why = why[:90]
-            print(f"{s.id:<20} {method.value:<11} {r.status.value:<24} {proposal:<10} {steps:>5} {llm_s:>6}  {why}")
-            records.append(asdict(r))
+        append_jsonl(args.out, [to_record(run_astar(ctx), ctx, env)])
+        for seed in range(args.seeds):
+            arms = run_llm_arms(ctx, planner, seed=seed)
+            append_jsonl(args.out, [to_record(r, ctx, env) for r in arms.values()])
+            any_r = next(iter(arms.values()))
+            print(f"  {s.id:<20} seed {seed}: llm {any_r.llm['status'] or 'no output'}, "
+                  f"{(any_r.proposal_latency_ms or 0) / 1000:.1f}s")
 
-    if args.json:
-        args.json.write_text(json.dumps(records, indent=2, default=str), encoding="utf-8")
-        print(f"\nSaved {len(records)} run records to {args.json}")
+    print(f"\nSaved run records to {args.out}\n")
+    print_summary(args.out)
     return 0
 
 
