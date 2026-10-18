@@ -1,0 +1,19 @@
+Mutation check run 2026-10-18T18:07:52+00:00
+
+CAUGHT   shield ignores restricted cells
+CAUGHT   shield ignores obstacles
+CAUGHT   shield ignores map edges
+CAUGHT   shield allows diagonal moves
+CAUGHT   shield budget off by one
+CAUGHT   shield skips return-to-base
+CAUGHT   shield skips start check
+CAUGHT   shield skips destination check
+CAUGHT   unsafe ignores budget overrun
+CAUGHT   jumps not swept for forbidden cells
+CAUGHT   runner counts parse failure as shield rejection
+CAUGHT   runner misses false infeasible
+CAUGHT   A* forgets return leg
+CAUGHT   A* budget off by one
+CAUGHT   traversable ignores restricted
+
+15/15 planted bugs caught
