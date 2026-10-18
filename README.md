@@ -49,6 +49,25 @@ python -m venv .venv
 # source .venv/bin/activate && pip install -r requirements.txt   # macOS/Linux
 ```
 
+## Local model
+
+Install [Ollama](https://ollama.com), then:
+
+```bash
+ollama pull qwen2.5:3b
+```
+
+The planner (`backend/app/llm_planner.py`) asks for strict JSON using Ollama's
+structured-output schema, caps output length based on the movement budget, and retries
+once on unparseable output (the retry samples at temperature 0.4 because temperature 0
+repeats itself). Raw responses are kept in each run record.
+
+Try every demo scenario with all three methods against the live model:
+
+```bash
+.venv/Scripts/python experiments/try_llm.py
+```
+
 ## Run the tests
 
 ```bash
@@ -56,11 +75,14 @@ cd backend
 ../.venv/Scripts/python -m pytest -q
 ```
 
+The one live-model test is skipped automatically when Ollama is not running.
+
 ## Layout
 
 ```
 backend/app/       mission model, A*, shield, simulator, run pipeline
 backend/tests/     pytest suite
+experiments/       scripts that run scenarios against the live model
 benchmark/         scenario definitions (demo set for now)
 ```
 

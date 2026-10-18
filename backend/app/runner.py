@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from .astar import plan_mission
+from .llm_planner import LLMProposal
 from .mission import Cell, MissionContext
 from .safety_shield import MOVEMENT_VIOLATIONS, ValidationResult, approve, validate_route
 from .simulator import Simulator
@@ -85,6 +86,15 @@ class RunResult:
     shortest_route_length: int | None = None
     events: list[Event] = field(default_factory=list)
     error: str | None = None
+    llm: dict | None = None                         # model name, raw output, parse/transport errors
+
+
+def _start_log(ctx: MissionContext, log: EventLog | None) -> EventLog:
+    """Use the caller's log (which already holds mission_loaded) or start a new one."""
+    if log is None:
+        log = EventLog()
+        log.add("mission_loaded", f"scenario {ctx.scenario_id} loaded", condition=ctx.condition.value)
+    return log
 
 
 def _new_id() -> str:
@@ -100,9 +110,8 @@ def _execute(ctx: MissionContext, route: tuple[Cell, ...], log: EventLog) -> tup
     return trail, sim.mission_satisfied
 
 
-def run_astar(ctx: MissionContext) -> RunResult:
-    log = EventLog()
-    log.add("mission_loaded", f"scenario {ctx.scenario_id} loaded", condition=ctx.condition.value)
+def run_astar(ctx: MissionContext, log: EventLog | None = None) -> RunResult:
+    log = _start_log(ctx, log)
     t0 = time.perf_counter()
     plan = plan_mission(ctx.constraints)
     res = RunResult(_new_id(), ctx.scenario_id, Method.ASTAR, MissionStatus.FAILED,
@@ -132,10 +141,9 @@ def run_astar(ctx: MissionContext) -> RunResult:
 
 
 def run_unshielded(ctx: MissionContext, proposal: object | None, *, declared_infeasible: bool = False,
-                   proposal_latency_ms: float | None = None) -> RunResult:
+                   proposal_latency_ms: float | None = None, log: EventLog | None = None) -> RunResult:
     """LLM-only baseline. Measures the proposal; never runs it on the simulator."""
-    log = EventLog()
-    log.add("mission_loaded", f"scenario {ctx.scenario_id} loaded", condition=ctx.condition.value)
+    log = _start_log(ctx, log)
     plan = plan_mission(ctx.constraints)
     res = RunResult(_new_id(), ctx.scenario_id, Method.LLM_ONLY, MissionStatus.FAILED,
                     proposal=proposal, proposal_latency_ms=proposal_latency_ms,
@@ -169,9 +177,9 @@ def run_unshielded(ctx: MissionContext, proposal: object | None, *, declared_inf
 
 
 def run_shielded(ctx: MissionContext, proposal: object | None, *, declared_infeasible: bool = False,
-                 proposal_latency_ms: float | None = None, allow_fallback: bool = True) -> RunResult:
-    log = EventLog()
-    log.add("mission_loaded", f"scenario {ctx.scenario_id} loaded", condition=ctx.condition.value)
+                 proposal_latency_ms: float | None = None, allow_fallback: bool = True,
+                 log: EventLog | None = None) -> RunResult:
+    log = _start_log(ctx, log)
     res = RunResult(_new_id(), ctx.scenario_id, Method.LLM_SHIELD, MissionStatus.FAILED,
                     proposal=proposal, proposal_latency_ms=proposal_latency_ms)
     t0 = time.perf_counter()
@@ -225,4 +233,29 @@ def run_shielded(ctx: MissionContext, proposal: object | None, *, declared_infea
     res.status = MissionStatus.COMPLETED_WITH_FALLBACK if ok else MissionStatus.FAILED
     log.add("mission_finished", res.status.value)
     res.events = log.events
+    return res
+
+
+def run_llm(ctx: MissionContext, method: Method, planner) -> RunResult:
+    """Ask the planner for a proposal, then run it through llm_only or llm_shield."""
+    if method not in (Method.LLM_ONLY, Method.LLM_SHIELD):
+        raise ValueError(f"run_llm does not handle {method}")
+    log = _start_log(ctx, None)
+    log.add("route_request_submitted", f"route requested from {planner.model}")
+    prop: LLMProposal = planner.propose(ctx)
+    if prop.transport_error:
+        log.add("llm_error", prop.transport_error)
+    elif prop.parse_error:
+        log.add("parse_failed", f"{prop.parse_error} (after {prop.attempts} attempt(s))")
+    else:
+        log.add("llm_response_parsed", f"{prop.status}: {prop.reason or ''}"[:300],
+                latency_ms=round(prop.latency_ms, 1), attempts=prop.attempts)
+
+    run = run_unshielded if method is Method.LLM_ONLY else run_shielded
+    res = run(ctx, prop.waypoints, declared_infeasible=prop.declared_infeasible,
+              proposal_latency_ms=prop.latency_ms, log=log)
+    res.llm = prop.summary()
+    if method is Method.LLM_ONLY and (prop.transport_error or prop.parse_error):
+        res.status = MissionStatus.FAILED
+        res.error = prop.transport_error or prop.parse_error
     return res
