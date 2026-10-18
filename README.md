@@ -11,8 +11,8 @@ world, without needlessly reducing mission completion.
 | Milestone | Contents | State |
 |---|---|---|
 | 1 | Grid simulator, A\*, safety shield, run pipeline, tests | done |
-| 2 | Local LLM planner (Ollama, `qwen2.5:3b`) | next |
-| 3 | Shield/fallback wired to live LLM output | — |
+| 2 | Local LLM planner (Ollama, `qwen2.5:3b`), wired into shield + fallback | done |
+| 3 | API backend (FastAPI) for the website | next |
 | 4 | Website (React + TypeScript) | — |
 | 5 | 60-scenario benchmark, 3 methods, results CSV | — |
 | 6 | Methodology, limitations, report | — |
