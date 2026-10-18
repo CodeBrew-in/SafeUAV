@@ -47,6 +47,11 @@ class Scenario(BaseModel):
     level: int | None = Field(default=None, ge=1, le=5)
     seed: int | None = None
     expected_feasible: bool | None = None
+    # benchmark metadata (descriptive only; never used by the planner, shield or simulator)
+    map_id: str | None = None
+    family: str | None = None
+    attack_target: str | None = None
+    optimal_steps: int | None = None
 
     @model_validator(mode="after")
     def _check_geometry(self) -> "Scenario":
