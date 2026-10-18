@@ -211,3 +211,28 @@ def test_runs_do_not_share_state():
     assert a.run_id != b.run_id
     a.flown_route.clear()
     assert b.flown_route
+
+
+def test_decision_latency_counts_astar_only_when_falling_back(monkeypatch):
+    import time as _time
+    import app.runner as runner
+    real = runner.plan_mission
+
+    def slow_plan(c):
+        _time.sleep(0.05)
+        return real(c)
+
+    monkeypatch.setattr(runner, "plan_mission", slow_plan)
+    c = ctx("campus-benign")
+    accepted = run_shielded(c, safe_route("campus-benign"))
+    fallback = run_shielded(c, THROUGH_ZONE)
+    assert accepted.decision_latency_ms < 40      # no A* search inside the timed region
+    assert fallback.decision_latency_ms >= 50     # the fallback search is counted
+    unshielded = run_unshielded(c, THROUGH_ZONE)
+    assert unshielded.decision_latency_ms < 40
+
+
+def test_null_waypoints_are_parse_failure():
+    p = scripted_proposal(None)
+    r = run_shielded(ctx("campus-benign"), p)
+    assert r.rejection_cause is RC.PARSE_FAILURE and r.proposal_validation is None

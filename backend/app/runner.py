@@ -219,6 +219,8 @@ def _judge_proposal(ctx: MissionContext, prop: LLMProposal, res: RunResult) -> R
     if prop.declared_infeasible:
         res.false_infeasible = bool(res.ground_truth_feasible)
         return RejectionCause.DECLARED_INFEASIBLE
+    if prop.waypoints is None:
+        return RejectionCause.PARSE_FAILURE  # "route_proposed" but no waypoints
     check = validate_route(prop.waypoints, ctx.constraints)
     res.proposal_validation = check
     if check.malformed:
@@ -288,8 +290,8 @@ def run_shielded(ctx: MissionContext, proposal: LLMProposal | object | None, *, 
         _log_proposal(log, prop)
     method = Method.LLM_SHIELD if allow_fallback else Method.LLM_SHIELD_NO_FALLBACK
     res = RunResult(_new_id(), ctx.scenario_id, method)
+    _ground_truth(ctx, res)  # bookkeeping only; kept outside the timed region
     t0 = time.perf_counter()
-    plan = _ground_truth(ctx, res)
     cause = _judge_proposal(ctx, prop, res)
 
     if cause is None:
@@ -313,6 +315,7 @@ def run_shielded(ctx: MissionContext, proposal: LLMProposal | object | None, *, 
 
     log.add("fallback_requested", "A* fallback requested", cause=cause.value)
     res.fallback_used = True
+    plan = plan_mission(ctx.constraints)  # timed: this search is the fallback's real cost
     if not plan.feasible:
         res.decision_latency_ms = (time.perf_counter() - t0) * 1000
         log.add("mission_infeasible", plan.message, outcome=plan.outcome.value)

@@ -20,7 +20,7 @@ def print_summary(path: Path) -> None:
     print(f"Model {env.get('model')}, Ollama {env.get('ollama_version')}, GPU {env.get('gpu')}, "
           f"commit {env.get('git_commit')}\n")
     header = (f"{'scenario':<20} {'seed':>4} {'method':<23} {'status':<25} {'cause':<32} "
-              f"{'flown':>5} {'viol':>4} {'llm s':>6} {'try':>3}")
+              f"{'prop':>4} {'flown':>5} {'viol':>4} {'llm s':>6} {'try':>3} {'T':>4}  codes")
     print(header)
     print("-" * len(header))
     for r in rows:
@@ -29,10 +29,15 @@ def print_summary(path: Path) -> None:
         viol = "-" if r["executed_violations"] is None else r["executed_violations"]
         llm_s = "-" if r["proposal_latency_ms"] is None else f"{r['proposal_latency_ms'] / 1000:.1f}"
         tries = r["llm_attempts"] if r["llm_attempts"] else "-"
+        prop_len = "-" if r["proposed_route_length"] is None else r["proposed_route_length"]
+        log = r["llm_attempt_log"] or []
+        temp = f"{log[-1]['temperature']:.1f}" if log else "-"  # attempt that produced the proposal
+        codes = ",".join(r["violation_codes"]) if r["method"] != "astar" else ""
         print(f"{r['scenario_id']:<20} {seed:>4} {r['method']:<23} {r['status']:<25} "
-              f"{r['rejection_cause'] or '':<32} {flown:>5} {viol:>4} {llm_s:>6} {tries:>3}")
-    print("\nflown = steps actually flown; viol = violations measured on the flown trail; "
-          "llm_only routes are never flown.")
+              f"{r['rejection_cause'] or '':<32} {prop_len:>4} {flown:>5} {viol:>4} {llm_s:>6} {tries:>3} "
+              f"{temp:>4}  {codes}")
+    print("\nprop = steps in the LLM proposal; flown = steps actually flown; viol = violations measured on the "
+          "flown trail;\nT = temperature of the attempt that produced the proposal; llm_only routes are never flown.")
 
 
 if __name__ == "__main__":
