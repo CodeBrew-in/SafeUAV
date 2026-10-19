@@ -156,6 +156,7 @@ def summary(ctl: Controller) -> dict:
 # --- LLM-direct: model writes waypoints, flown without a shield ------------------------------------------
 
 def fly_direct(route, clock: float, gold: MissionSpec | None, cap: float = CAP, actual: Wind = CALM) -> dict:
+    gold = gold if isinstance(gold, MissionSpec) else None  # a question/refusal gold has no zones to check
     pts = coerce_route(route)
     if pts is None:
         return {"flown": False, "malformed": True}
