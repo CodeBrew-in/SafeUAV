@@ -45,18 +45,74 @@ class AvoidRule:
         return any(a <= t1 and t0 <= b for a, b in self.intervals())
 
 
+COND_KINDS = ("skip_if_battery_below", "closest_of", "stay_if_battery_below")
+MAX_CONDITIONS = 4
+
+
+@dataclass(frozen=True)
+class Condition:
+    """A rule the drone decides DURING the flight. A closed list of three kinds, so an order can only
+    skip stops or end the flight early: it can never loosen a safety rule.
+
+    skip_if_battery_below  places=(X,)  : skip stop X if the battery is under `pct` % when X is next.
+    closest_of             places=(A,B) : of these stops, visit only the one nearest the drone when the first is next.
+    stay_if_battery_below  places=()    : after the last stop, land there instead of flying home if under `pct` %.
+    Every place named here must also be one of the mission's targets.
+    """
+    kind: str
+    places: tuple[str, ...] = ()
+    pct: float | None = None
+
+    def to_json(self) -> dict:
+        return {"kind": self.kind, "places": list(self.places), "battery_pct": self.pct}
+
+    def describe(self) -> str:
+        if self.kind == "skip_if_battery_below":
+            return f"skip {self.places[0]} if the battery is below {self.pct:g}%"
+        if self.kind == "closest_of":
+            return "visit only the nearest of " + ", ".join(self.places)
+        return f"stay at the last place if the battery is below {self.pct:g}% (otherwise return to base)"
+
+
 @dataclass(frozen=True)
 class MissionSpec:
     targets: tuple[str, ...]           # inspection targets, in order
     avoid: tuple[AvoidRule, ...] = ()
     return_to_base: bool = True
+    conditions: tuple[Condition, ...] = ()
 
     def to_json(self) -> dict:
         def hhmm(m):
             return None if m is None else f"{m // 60:02d}:{m % 60:02d}"
-        return {"targets": list(self.targets),
-                "avoid": [{"zone": r.zone, "from": hhmm(r.start_min), "to": hhmm(r.end_min)} for r in self.avoid],
-                "stay_at_end": not self.return_to_base}
+        d = {"targets": list(self.targets),
+             "avoid": [{"zone": r.zone, "from": hhmm(r.start_min), "to": hhmm(r.end_min)} for r in self.avoid],
+             "stay_at_end": not self.return_to_base}
+        if self.conditions:
+            d["conditions"] = [c.to_json() for c in self.conditions]
+        return d
+
+    def pruned(self) -> "MissionSpec":
+        """Drop condition places that are no longer targets, and conditions left with nothing to decide."""
+        from .campus import norm
+
+        def key(n):
+            try:
+                return norm(n)
+            except ValueError:
+                return None
+        have = {key(t) for t in self.targets}
+        out = []
+        for c in self.conditions:
+            if c.kind == "closest_of":
+                places = tuple(p for p in c.places if key(p) in have)
+                if len(places) >= 2:
+                    out.append(Condition(c.kind, places, c.pct))
+            elif c.kind == "skip_if_battery_below":
+                if c.places and key(c.places[0]) in have:
+                    out.append(c)
+            else:
+                out.append(c)
+        return self if tuple(out) == self.conditions else MissionSpec(self.targets, self.avoid, self.return_to_base, tuple(out))
 
 
 @dataclass
@@ -116,7 +172,39 @@ def spec_from_json(obj: object) -> MissionSpec:
             raise ValueError("'return_to_base' must be true or false")
     if len(targets) > 10:
         raise ValueError("at most 10 targets")
-    return MissionSpec(tuple(targets), tuple(rules), rtb)
+    return MissionSpec(tuple(targets), tuple(rules), rtb, _conditions_from_json(obj.get("conditions")))
+
+
+def _conditions_from_json(raw) -> tuple[Condition, ...]:
+    """Strict: an unknown kind, a wrong shape or a silly percentage rejects the whole answer."""
+    if raw in (None, []):
+        return ()
+    if not isinstance(raw, list) or len(raw) > MAX_CONDITIONS:
+        raise ValueError(f"'conditions' must be a list of at most {MAX_CONDITIONS} rules")
+    out = []
+    for c in raw:
+        if not isinstance(c, dict) or c.get("kind") not in COND_KINDS:
+            raise ValueError(f"unknown condition {str(c)[:80]!r}")
+        places = c.get("places") or []
+        if not isinstance(places, list) or not all(isinstance(p, str) for p in places) or len(places) > 4:
+            raise ValueError("condition 'places' must be a list of at most 4 place names")
+        kind, pct = c["kind"], c.get("battery_pct")
+        if kind == "closest_of":
+            if not 2 <= len(places) <= 4:
+                raise ValueError("closest_of needs 2 to 4 places")
+            pct = None
+        else:
+            if isinstance(pct, bool) or not isinstance(pct, (int, float)) or not math.isfinite(pct) or not 5 <= pct <= 95:
+                raise ValueError("battery_pct must be a number from 5 to 95")
+            pct = float(pct)
+            if kind == "skip_if_battery_below" and len(places) != 1:
+                raise ValueError("skip_if_battery_below needs exactly one place")
+            if kind == "stay_if_battery_below":
+                places = []
+        cond = Condition(kind, tuple(places), pct)
+        if cond not in out:
+            out.append(cond)
+    return tuple(out)
 
 
 def validate_spec(spec: MissionSpec, campus, *, now_min: float, horizon_min: float,
@@ -135,6 +223,11 @@ def validate_spec(spec: MissionSpec, campus, *, now_min: float, horizon_min: flo
     remaining = [t for t in spec.targets if _key(t, norm) not in visited]
     if not spec.targets:
         errors.append("no inspection targets")
+    tkeys = {_key(t, norm) for t in spec.targets}
+    for cond in spec.conditions:
+        for p in cond.places:
+            if _key(p, norm) not in tkeys:
+                errors.append(f"condition place {p!r} must also be one of the targets")
     for name in [*spec.targets, *(r.zone for r in spec.avoid)]:
         k = _key(name, norm)
         if k is None:

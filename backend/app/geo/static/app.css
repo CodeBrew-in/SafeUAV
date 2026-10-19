@@ -142,3 +142,10 @@ label.f input, label.f select { font: inherit; padding: 4px 6px; border: 1px sol
 .chip.ok { color: #0b5a2b; border-color: #86d4a5; }
 .chip.warn { color: #7a3d00; border-color: #f2c06b; background: #fff7e6; }
 .chip.hidden { display: none; }
+
+#cmp { position: relative; margin: 6px 0; padding: 8px; border: 1px solid var(--line, #d0d7de); border-radius: 8px; background: #fff; font-size: 12px; }
+#cmp .x { position: absolute; right: 4px; top: 2px; border: 0; background: none; font-size: 16px; cursor: pointer; }
+.cmpgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
+.cmpcol h4 { margin: 0 0 4px; font-size: 12px; }
+.cmpcol p { margin: 2px 0; }
+#compare { margin-left: 4px; }

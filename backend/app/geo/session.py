@@ -89,7 +89,10 @@ def merge_reply(base: MissionSpec, reply: MissionSpec, cur: MissionSpec) -> Miss
             avoid[k] = r
     stay_changed = reply.return_to_base != base.return_to_base
     rtb = reply.return_to_base if stay_changed else cur.return_to_base
-    return MissionSpec(tuple(targets), tuple(avoid.values()), rtb)
+    b_c, r_c = set(base.conditions), set(reply.conditions)
+    conds = [c for c in cur.conditions if not (c in b_c and c not in r_c)]          # the AI took these away
+    conds += [c for c in reply.conditions if c not in b_c and c not in conds]       # the AI added these
+    return MissionSpec(tuple(targets), tuple(avoid.values()), rtb, tuple(conds)).pruned()
 
 
 def apply_parts(cur: MissionSpec, targets: list[str], avoid: list[AvoidRule], stay: bool) -> MissionSpec:
@@ -99,7 +102,7 @@ def apply_parts(cur: MissionSpec, targets: list[str], avoid: list[AvoidRule], st
     av = {_k(r.zone): r for r in cur.avoid}
     for r in avoid:
         av[_k(r.zone)] = r
-    return MissionSpec(tuple(new_t), tuple(av.values()), cur.return_to_base and not stay)
+    return MissionSpec(tuple(new_t), tuple(av.values()), cur.return_to_base and not stay, cur.conditions).pruned()
 
 
 # --- the session --------------------------------------------------------------------------------
@@ -363,6 +366,7 @@ class Session:
 
     def _commit(self, new: MissionSpec, *, source: str, text: str) -> None:
         """Validate and apply a new desired mission. Before Start only the draft changes."""
+        new = new.pruned()
         if self.started:
             if self.safety_pending and self.ctl.state in FLYING:
                 raise SessionError("The drone is landing or returning on your command. Give the new order once it is down.")
@@ -754,6 +758,48 @@ class Session:
         except SessionError as e:
             self.say("system", f"Not applied: {e}", level="bad")
 
+    # --- Classic vs AI, side by side (never touches the live drone) ----------------------------------
+    def compare(self, text: str, battery_pct: float = 100.0) -> dict:
+        """Read one order with the basic parser and with the AI, then fly each reading in a private simulation
+        (same campus, wind and battery) and report what each would do. The shield judges both the same way."""
+        text = str(text)[:2000].strip()
+        if not text:
+            raise SessionError("Type an order to compare.")
+        try:
+            pct = min(100.0, max(15.0, float(battery_pct)))
+        except (TypeError, ValueError):
+            raise SessionError("Battery must be a number.")
+        if pct != pct:
+            raise SessionError("Battery must be a number.")
+        with self.lock:
+            cfg, campus, hh = self.cfg, self.campus, self.ctl.hhmm()
+        classic = RegexParser(campus).parse(text)
+        llm = self.llm_factory(cfg.model)
+        deadline = AI_DEADLINE_S["gemini" if cfg.model.startswith("gemini") else "ollama"]
+        ai = interpret(text, llm, campus, current=None, visited=[], hhmm=hh, deadline_s=deadline, keywords=False)
+        return {"order": text, "battery_pct": pct,
+                "classic": self._dry_fly(classic, pct), "ai": self._dry_fly(ai, pct)}
+
+    def _dry_fly(self, interp, pct: float) -> dict:
+        cfg, campus = self.cfg, self.campus
+        if interp.command is None or interp.command.spec is None:
+            return {"understood": False, "message": self._short_reason(interp.message) if interp.status == "error" else interp.message}
+        spec = interp.command.spec
+        out = {"understood": True, "spec": spec.to_json(), "rules": [c.describe() for c in spec.conditions]}
+        chk = validate_spec(spec, campus, now_min=parse_time(cfg.clock), horizon_min=horizon_min(cfg.capacity))
+        if not chk.ok:
+            return {**out, "shield": "refused", "reasons": chk.errors}
+        ctl = Controller(campus, capacity_wh=cfg.capacity, forecast=FORECAST, actual=Wind(cfg.wind_speed, cfg.wind_from),
+                         clock_min=parse_time(cfg.clock), monitor=cfg.monitor)
+        ctl.energy = cfg.capacity * pct / 100.0
+        ctl.submit(Command("order", spec, "compare"))
+        ctl.run()
+        names = lambda keys: [campus.places[k].name for k in keys if k in campus.places]
+        why = [e["msg"] for e in ctl.audit if e["kind"] in ("replan_failed", "order_rejected")]
+        return {**out, "shield": "refused" if ctl.state == "PREFLIGHT" else "accepted", "reasons": why[:2],
+                "visited": names(ctl.visited), "skipped": names(sorted(ctl.skipped)), "final_state": ctl.state,
+                "battery_left_pct": round(100 * ctl.energy / ctl.capacity, 1)}
+
     def _direct(self, text: str, hh: str, gen: int) -> None:
         from .bench import ask_direct, fly_direct
         llm = self.llm_factory(self.cfg.model)
@@ -817,7 +863,7 @@ class Session:
                 "desired": self.desired.to_json(), "base": list(self.campus.base),
                 "visited_names": [self.campus.places[v].name for v in ctl.visited if v in self.campus.places],
                 "targets": [{"name": t, "center": [round(self.campus.find(t).center[0], 1), round(self.campus.find(t).center[1], 1)],
-                             "done": _k(t) in ctl.visited} for t in self.desired.targets],
+                             "done": _k(t) in ctl.visited, "skipped": _k(t) in ctl.skipped} for t in self.desired.targets],
                 "chat": self.chat[max(0, g("chat") - self.chat_dropped):], "chat_total": self.chat_dropped + len(self.chat),
                 "audit": ctl.audit[g("audit"):], "audit_total": len(ctl.audit),
                 "track": [[round(x, 1), round(y, 1), s] for _, x, y, s in ctl.track[g("track"):]],

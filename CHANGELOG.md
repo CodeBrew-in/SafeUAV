@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.75 - Phase 3.75: orders with "if" in them
+
+- **Conditional missions.** The AI turns "skip the hostel if the battery is below 40%", "whichever of the canteen or the hostel is closer"
+  and "come home unless the battery is below 30%" into up to 4 rules from a closed list of three kinds. The basic parser cannot read them.
+- Rules can only skip stops or end the flight early. They are checked strictly (unknown kind, bad percentage or a place that is not a target
+  rejects the answer), decided live by the controller, and every changed plan goes through the shield again. No safety limit has a rule field.
+- **Compare**: one order read by the basic parser and by the AI, each flown in a private simulation at the same battery, shown side by side.
+  The live drone is not touched.
+- The Mission tab lists the rules and marks skipped stops; the log and a toast show when a rule fires.
+
 ## 0.3.5 - Phase 3.5: public demo
 
 - Public mode (`SAFEUAV_PUBLIC=1`): public host only, HTTPS origins, HSTS, listens on the host's `PORT`, `/healthz`.

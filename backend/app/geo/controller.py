@@ -72,6 +72,8 @@ class Controller:
         self.state = "PREFLIGHT"
         self.spec: MissionSpec | None = None
         self.visited: list[str] = []          # normalised names, in the order inspected
+        self.skipped: set[str] = set()        # stops an order's conditions skipped (normalised names)
+        self.force_stay = False               # a 'stay if battery low' condition fired: land at the last stop
         self.plan: Plan | None = None
         self.ri = 1                           # index of the next route point
         self.version = 0
@@ -110,7 +112,65 @@ class Controller:
             self._log("state", f"{old} -> {s}: {why}")
 
     def remaining_targets(self, spec: MissionSpec) -> list[str]:
-        return [t for t in spec.targets if norm(t) not in self.visited]
+        return [t for t in spec.targets if norm(t) not in self.visited and norm(t) not in self.skipped]
+
+    # --- conditions: decided during the flight, only ever skipping stops or ending early -------------------
+    def _decide(self, spec: MissionSpec) -> bool:
+        """Resolve the order's conditions for the next stop. True if a stop was skipped."""
+        changed = False
+        for _ in range(12):
+            rem = self.remaining_targets(spec)
+            if not rem:
+                break
+            k, pct, step = norm(rem[0]), 100.0 * self.energy / self.capacity, False
+            for c in spec.conditions:
+                keys = [norm(p) for p in c.places]
+                # the battery never rises in flight, so a skip rule that is already true stays true: apply it now
+                if c.kind == "skip_if_battery_below" and pct < c.pct and keys[0] in {norm(r) for r in rem}:
+                    self._skip(next(r for r in rem if norm(r) == keys[0]), f"battery is {pct:.0f}%, below {c.pct:g}%")
+                    step = True
+                elif c.kind == "closest_of" and k in keys:
+                    live = [p for p in c.places if norm(p) not in self.visited and norm(p) not in self.skipped]
+                    if any(norm(p) in self.visited for p in c.places):
+                        drop, best = live, None
+                    else:
+                        best = min(live, key=lambda p: dist(self.pos, self.c.find(p).center))
+                        drop = [p for p in live if p != best]
+                    for p in drop:
+                        self._skip(p, f"{best} is the nearest of {', '.join(c.places)}" if best else "one of them is already done")
+                    step = bool(drop)
+                if step:
+                    break
+            if not step:
+                break
+            changed = True
+        return changed
+
+    def _skip(self, name: str, why: str) -> None:
+        self.skipped.add(norm(name))
+        self._log("condition", f"skipping {name}: {why}")
+
+    def _after_visit(self) -> None:
+        spec = self.spec
+        if spec is None or not spec.conditions:
+            return
+        changed = self._decide(spec)
+        if not self.remaining_targets(spec) and spec.return_to_base and not self.force_stay:
+            pct = 100.0 * self.energy / self.capacity
+            for c in spec.conditions:
+                if c.kind == "stay_if_battery_below" and pct < c.pct:
+                    self.force_stay = changed = True
+                    self._log("condition", f"battery is {pct:.0f}%, below {c.pct:g}%: landing at the last stop instead of flying home")
+                    break
+        if changed and not self.remaining_targets(spec) and not (spec.return_to_base and not self.force_stay):
+            # nothing left to fly to and no trip home: land right here, at the stop just inspected
+            self._swap(Plan([self.pos], "mission", "the last stop"), "nothing left to inspect: landing at the last stop")
+        elif changed:
+            plan, reasons = self._mission_plan(spec, True)
+            if plan is not None:
+                self._swap(plan, "route re-checked by the shield after a condition changed the plan")
+            else:
+                self._go_to_pad("condition changed the plan but no safe route remains: " + "; ".join(reasons))
 
     # --- public API ----------------------------------------------------------------------------------
     def submit(self, cmd: Command) -> None:
@@ -143,6 +203,7 @@ class Controller:
         Only used by the console; the benchmark never sends orders after DONE."""
         if self.state == "DONE":
             self.visited = []
+            self.skipped, self.force_stay = set(), False
             self.landed_at = self.t
             self._set_state("LANDED_WAIT", "ready for a new order")
 
@@ -185,6 +246,8 @@ class Controller:
         for w in check.warnings:
             self._log("warning", w)
         self.spec = spec  # valid new rules apply from now on, even if the mission becomes impossible
+        self.skipped, self.force_stay = set(), False
+        self._decide(spec)
         self._log("replan", "replanning from the current position" if airborne else "planning")
         plan, reasons = self._mission_plan(spec, airborne)
         if plan is not None:
@@ -214,13 +277,14 @@ class Controller:
             esc = [self.pos]
         remaining = self.remaining_targets(spec)
         stops = [self.c.find(t).center for t in remaining]
-        if spec.return_to_base:
+        rtb = spec.return_to_base and not self.force_stay
+        if rtb:
             end_name, end = self._home(air)
             if end is None:
                 return None, ["no usable landing pad to finish at"]
         else:
             end_name, end = (remaining[-1], stops[-1]) if remaining else ("here", esc[-1])
-        tail = plan_through(air, esc[-1], stops + ([end] if spec.return_to_base else []))
+        tail = plan_through(air, esc[-1], stops + ([end] if rtb else []))
         if tail is None:
             return None, ["no safe path to the remaining targets"]
         route = esc[:-1] + tail
@@ -373,6 +437,7 @@ class Controller:
         if point_segment_distance(p, a, b) <= VISIT_RADIUS:
             self.visited.append(norm(nxt))
             self._log("inspected", f"inspected {nxt}")
+            self._after_visit()
 
     def _check_battery(self) -> bool:
         if self.energy <= 0:
@@ -424,7 +489,7 @@ class Controller:
             "pos": [round(self.pos[0], 1), round(self.pos[1], 1)],
             "battery_wh": round(self.energy, 2), "battery_pct": round(100 * self.energy / self.capacity, 1),
             "spec": self.spec.to_json() if self.spec else None,
-            "visited": list(self.visited),
+            "visited": list(self.visited), "skipped": sorted(self.skipped),
             "route": [[round(x, 1), round(y, 1)] for x, y in self.plan.route] if self.plan else [],
             "route_index": self.ri, "version": self.version,
         }

@@ -437,6 +437,7 @@ function auditToast(e, prevState) {
   if (e.kind === 'takeoff') return toast('TAKE-OFF', 'The drone is airborne.', 'ok');
   if (e.kind === 'replan') return /^replanning/.test(m) ? toast('REPLANNING', 'Checking the new route with the shield…') : null;
   if (e.kind === 'monitor') return toast('BATTERY CHECK', m, 'warn');
+  if (e.kind === 'condition') return toast('RULE APPLIED', m, 'warn');
   if (e.kind === 'warning') return toast('NOTE', m, 'warn');
   if (e.kind === 'state') {
     const to = (m.split('->')[1] || '').trim().split(':')[0].trim(), why = (m.split(':').slice(1).join(':') || '').trim();
@@ -448,10 +449,16 @@ function auditToast(e, prevState) {
 }
 
 // ---------------------------------------------------------------- panels
+function condText(c) {
+  if (c.kind === 'skip_if_battery_below') return `skip ${c.places[0]} if battery < ${c.battery_pct}%`;
+  if (c.kind === 'closest_of') return `only the nearest of ${c.places.join(' / ')}`;
+  return `stay at the last place if battery < ${c.battery_pct}%`;
+}
 function specText(sp) {
   if (!sp) return '';
   const av = sp.avoid.map(a => a.zone + (a.from || a.to ? ` (${a.from || 'now'}–${a.to || '∞'})` : ''));
-  return `Targets: ${sp.targets.join(' → ') || '—'}${av.length ? ' · Restricted: ' + av.join(', ') : ''} · ${sp.stay_at_end ? 'stays at the last place' : 'returns to base'}`;
+  const cs = (sp.conditions || []).map(condText);
+  return `Targets: ${sp.targets.join(' → ') || '—'}${av.length ? ' · Restricted: ' + av.join(', ') : ''} · ${sp.stay_at_end ? 'stays at the last place' : 'returns to base'}${cs.length ? ' · Rules: ' + cs.join('; ') : ''}`;
 }
 function updateControls() {
   const ph = S.phase, flying = ph === 'FLYING' || ph === 'PAUSED', waiting = ph === 'WAITING', ended = ['GROUNDED', 'CRASHED'].includes(ph);
@@ -503,12 +510,16 @@ function renderMission() {
     h('select', { id: 'f-base', disabled: locked, onchange: e => config({ base_pad: e.target.value }) }, Object.keys(MAP.pads).map(n => h('option', { value: n, selected: n === c.base_pad }, n))),
     h('h3', {}, 'Targets (in order)'));
   if (!S.desired.targets.length) root.append(h('div', { class: 'hint' }, 'Click a building on the map, or type an order in Chat.'));
-  S.targets.forEach((t, i) => root.append(h('div', { class: 'item' }, h('span', { class: 'n' + (t.done ? ' done' : '') }, t.done ? '✓' : i + 1), t.name,
+  S.targets.forEach((t, i) => root.append(h('div', { class: 'item' }, h('span', { class: 'n' + (t.done ? ' done' : '') }, t.done ? '✓' : t.skipped ? '–' : i + 1), t.name + (t.skipped ? ' (skipped by a rule)' : ''),
     h('button', { class: 'x small', disabled: ended || S.phase === 'DONE', onclick: () => edit('target_remove', t.name), title: 'Remove' }, '✕'))));
   root.append(h('h3', {}, 'Restricted areas'));
   if (!S.desired.avoid.length) root.append(h('div', { class: 'hint' }, 'None. Click a building and choose Restrict, or say “stay away from …”.'));
   S.desired.avoid.forEach(a => root.append(h('div', { class: 'item' }, h('span', { class: 'n avoid' }, '!'), a.zone + (a.from || a.to ? ` (${a.from || 'now'}–${a.to || '∞'})` : ''),
     h('button', { class: 'x small', disabled: ended, onclick: () => edit('avoid_remove', a.zone), title: 'Allow again' }, '✕'))));
+  if ((S.desired.conditions || []).length) {
+    root.append(h('h3', {}, 'Rules the drone decides in flight'));
+    S.desired.conditions.forEach(c => root.append(h('div', { class: 'item' }, h('span', { class: 'n avoid' }, '?'), condText(c))));
+  }
   root.append(h('div', { class: 'row' }, h('label', {}, h('input', { type: 'checkbox', id: 'f-stay', checked: S.desired.stay_at_end, disabled: ended, onchange: e => edit('stay', null, e.target.checked) }), ' Stay at the last place (don’t return to base)')));
   if (!locked) root.append(h('button', { class: 'small', onclick: () => edit('clear') }, 'Clear mission'));
   root.append(h('h3', {}, 'Settings'));
@@ -527,6 +538,19 @@ function renderMission() {
     h('div', { class: 'row' }, h('label', {}, h('input', { type: 'checkbox', id: 'f-mon', checked: c.monitor, disabled: locked, onchange: e => config({ monitor: e.target.checked }) }), ' Runtime battery monitor')));
   if (active) { const el = $(active); if (el && el.focus) el.focus(); }
   root.scrollTop = 0;
+}
+
+function renderCompare(r) {
+  const col = (title, x) => {
+    const body = !x.understood ? [h('p', { class: 'bad' }, 'Did not understand: ' + x.message)] : [
+      h('p', {}, specText(x.spec)),
+      h('p', { class: x.shield === 'accepted' ? 'ok' : 'bad' }, x.shield === 'accepted' ? 'Shield: accepted · ended ' + x.final_state + ' · battery left ' + x.battery_left_pct + '%' : 'Shield: refused · ' + (x.reasons || []).join('; ')),
+      x.shield === 'accepted' ? h('p', {}, 'Flew: ' + (x.visited.join(' → ') || 'nothing') + (x.skipped.length ? ' · skipped: ' + x.skipped.join(', ') : '')) : null];
+    return h('div', { class: 'cmpcol' }, h('h4', {}, title), body);
+  };
+  $('cmp').replaceChildren(h('button', { class: 'x', onclick: () => $('cmp').classList.add('hidden'), 'aria-label': 'Close' }, '×'),
+    h('div', { class: 'hint' }, 'Same order, same battery (' + r.battery_pct + '%). The drone was not touched.'),
+    h('div', { class: 'cmpgrid' }, col('Without AI (basic parser)', r.classic), col('AI + shield', r.ai)));
 }
 
 function renderChat() {
@@ -646,6 +670,12 @@ async function init() {
   });
   $('downloads').append(h('span', { class: 'lbl' }, 'Download:'), ...[['report.html', 'Flight report'], ['audit.jsonl', 'Audit log'], ['track.csv', 'Track CSV']].map(([k, t]) => h('button', { class: 'small', onclick: () => download(k) }, t)));
   MAP.presets.forEach(p => $('presets').append(h('button', { type: 'button', onclick: () => { $('chatin').value = p.text; $('chatin').focus(); } }, p.label)));
+  $('compare').onclick = async () => {
+    const t = $('chatin').value.trim(); if (!t) return showReject('Type an order first, then press Compare.');
+    const box = $('cmp'), btn = $('compare'); btn.disabled = true; box.classList.remove('hidden'); box.textContent = 'Reading the order both ways…';
+    try { renderCompare(await api('/api/compare', { text: t, battery_pct: S ? S.battery_pct : 100 })); } catch (err) { box.classList.add('hidden'); showReject(err.message); }
+    btn.disabled = false;
+  };
   $('chatform').onsubmit = async e => {
     e.preventDefault(); const t = $('chatin').value.trim(); if (!t) return;
     try { await api('/api/chat', { text: t }); $('chatin').value = ''; busySince = performance.now(); poll(); } catch (err) { showReject(err.message); }
