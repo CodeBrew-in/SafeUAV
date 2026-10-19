@@ -101,7 +101,13 @@ class RegexParser:
         self.c = campus
         self.names = [p["name"] for p in describe_places(campus)]
 
-    def parse(self, text: str) -> Interpretation:
+    def parse_parts(self, text: str, split_and: bool = False) -> "tuple[list[str], list[AvoidRule], bool]":
+        """(targets in order, avoid rules, stay_at_end) found in the text. No validation.
+
+        split_and=True (live fallback only) also splits '... and avoid X' into two clauses. The
+        benchmarked baseline keeps it False, so its published numbers do not change."""
+        if split_and:
+            text = re.sub(r"\band\b(?=\s+(?:avoid|stay (?:away|off)|keep (?:clear|out)|don'?t|do not|never|skip))", ".", text, flags=re.I)
         clauses = re.split(r"[.;\n]|,\s*(?:and\s+)?(?:then\s+)?|\bthen\b|\bbut\b", text)
         targets, avoid = [], []
         for cl in clauses:
@@ -120,9 +126,13 @@ class RegexParser:
                 avoid += [AvoidRule(n, s, e) for n in found]
             else:
                 targets += [n for n in found if n not in targets]
+        return targets, avoid, bool(self.STAY.search(text))
+
+    def parse(self, text: str) -> Interpretation:
+        targets, avoid, stay = self.parse_parts(text)
         if not targets:
             return Interpretation(None, "clarify", "Question: which place should the drone inspect?")
-        spec = MissionSpec(tuple(targets), tuple(avoid), not self.STAY.search(text))
+        spec = MissionSpec(tuple(targets), tuple(avoid), not stay)
         return Interpretation(Command("order", spec, text), "applied", "Parsed order (regex)")
 
     def _places(self, clause: str) -> list[str]:
