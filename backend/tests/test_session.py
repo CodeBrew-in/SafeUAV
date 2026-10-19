@@ -809,3 +809,14 @@ def test_if_the_ai_still_cannot_decide_the_question_is_shown():
     s = sess(Scripted([ask, ask]))
     s.handle("go to the hall")
     assert any(c.get("status") == "clarify" for c in s.chat) and s.pending_clarify
+
+
+def test_land_at_an_unclear_name_takes_the_place_the_ai_names_and_never_asks():
+    ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Did you mean Tan Complex?"}
+    s = sess(Scripted([ask]))
+    _fly(s)
+    before = s.desired.targets
+    s.handle("land at tan")
+    texts = [c["text"] for c in s.chat if c["who"] != "operator"]
+    assert not any(c.get("status") == "clarify" for c in s.chat)
+    assert any("not a landing pad" in t for t in texts) and s.desired.targets == before

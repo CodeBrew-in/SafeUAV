@@ -696,7 +696,10 @@ class Session:
         names: list[str] = []
         if kind == "ai" and r.status == "applied":
             names = list(r.command.spec.targets)
-        elif kind == "ai" and r.status in ("refused", "clarify"):
+        elif kind == "ai" and r.status == "clarify":     # no questions: take the one place the question names
+            hits = [pl.name for pl in self.campus.places.values() if _k(pl.name) in _k(r.message)]
+            names = hits if len(hits) == 1 else []
+        elif kind == "ai" and r.status == "refused":
             self.say("ai", r.message, status=r.status)
             return
         else:
