@@ -134,3 +134,19 @@ class BudgetLLM:
         if not self.budget.take():
             return LLMReply(self.provider, self.model, None, None, 0.0, "the daily AI limit for this demo is used up")
         return self.inner.ask(system, user, schema, seed=seed, max_tokens=max_tokens)
+
+
+def classify_ai_error(err: str | None) -> tuple[str, str]:
+    """(state, short detail) for the status chip: ok, no_key, key_rejected, quota, budget, error."""
+    if not err:
+        return "ok", ""
+    e = err.lower()
+    if "not set" in e:
+        return "no_key", "no API key is set"
+    if "daily ai limit" in e:
+        return "budget", "the daily limit for this demo is used up"
+    if "401" in e or "403" in e or "api key" in e or "permission" in e:
+        return "key_rejected", "the provider rejected the API key"
+    if "429" in e or "quota" in e or "rate" in e:
+        return "quota", "the provider's quota is used up"
+    return "error", "the AI did not answer"

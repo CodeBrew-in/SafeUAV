@@ -75,7 +75,7 @@ def test_public_page_data_has_the_hosted_model_only_and_the_budget_in_health(pub
     m = call(pub, "GET", "/api/map")[1]
     assert m["public"] is True and all(x.startswith("gemini") for x in m["models"])
     h = call(pub, "GET", "/api/health")[1]
-    assert h["public"] is True and h["ollama_models"] == [] and h["ai_budget_left"] == 5
+    assert h["public"] is True and h["ollama_models"] == [] and h["ai_budget_left"] in (4, 5)
     assert b"AIza" not in json.dumps(h).encode()
     st, js, _, _ = call(pub, "POST", "/api/config", {"model": "qwen2.5:7b"}, drone=D1)
     assert st == 400 and "Model must be one of" in js["error"]
@@ -148,3 +148,29 @@ def test_local_mode_is_unchanged_and_listens_on_loopback_only():
         assert app.hosts() == {f"127.0.0.1:{app.port}", f"localhost:{app.port}"}
     finally:
         srv.server_close()
+
+
+@pytest.mark.parametrize("err,state", [(None, "ok"), ("GEMINI_API_KEY is not set", "no_key"), ("HTTP 401: nope", "key_rejected"),
+                                       ("HTTP 403 forbidden", "key_rejected"), ("HTTP 429 too many", "quota"),
+                                       ("the daily AI limit for this demo is used up", "budget"), ("boom", "error")])
+def test_ai_errors_are_classified_for_the_status_chip(err, state):
+    from app.geo.public import classify_ai_error
+    assert classify_ai_error(err)[0] == state
+
+
+def test_the_ai_self_check_reports_a_rejected_key_in_health():
+    import time
+
+    class Rejected:
+        def ask(self, *a, **k):
+            return LLMReply("gemini", "m", None, None, 1.0, "HTTP 401: API key not valid")
+    app = App(Session(llm_factory=lambda m: Rejected()))
+    assert app.ai_status()["state"] == "checking"
+    for _ in range(50):
+        time.sleep(0.05)
+        if app.ai_status()["state"] != "checking":
+            break
+    st = app.ai_status()
+    assert st["state"] == "key_rejected"
+    assert "AIza" not in json.dumps(st)
+    assert app.health()["ai_status"]["state"] in ("key_rejected", "checking")

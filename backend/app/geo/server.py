@@ -29,7 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 from .basemap import build_basemap
 from .flight import AVOID_BUFFER
 from .llm import gemini_key
-from .public import AiBudget, BudgetLLM, Limiter, PublicConfig, PublicConfigError, from_env
+from .public import AiBudget, BudgetLLM, Limiter, PublicConfig, PublicConfigError, classify_ai_error, from_env
 from .session import MODELS, MODES, SPEEDS, Session, SessionError
 from .version import VERSION
 
@@ -71,6 +71,8 @@ class App:
         self.limiter = Limiter()
         self.budget = AiBudget(self.public.ai_daily_budget)
         self.max_drones = self.public.max_drones if self.public.enabled else MAX_DRONES
+        self._ai: dict | None = None             # last result of the AI self-check
+        self.ai_lock = threading.Lock()
         self.session = session or Session()
         if self.public.enabled:                  # every AI call spends from one daily budget
             inner = self.session.llm_factory
@@ -82,6 +84,30 @@ class App:
         self.port = 0
         self.slots = threading.BoundedSemaphore(MAX_THREADS)
         self._health: tuple[float, dict] | None = None
+
+    def ai_status(self) -> dict:
+        """Does the hosted AI really answer? One tiny call at start and then every 30 minutes, in the background."""
+        now = time.monotonic()
+        with self.ai_lock:
+            st = self._ai
+            if st and (now - st["t"] < 1800 if st["state"] != "checking" else now - st["t"] < 90):
+                return {k: v for k, v in st.items() if k != "t"}
+            self._ai = {"state": "checking", "detail": "", "t": now}
+        threading.Thread(target=self._ai_probe, daemon=True).start()
+        return {"state": "checking", "detail": ""}
+
+    def _ai_probe(self) -> None:
+        model = self.session.cfg.model
+        if not model.startswith("gemini"):
+            res = {"state": "not_checked", "detail": "local model"}
+        else:
+            try:
+                r = self.session.llm_factory(model).ask("Reply with JSON.", "{}", {"type": "object"}, max_tokens=8)
+                res = dict(zip(("state", "detail"), classify_ai_error(r.error)))
+            except Exception:
+                res = {"state": "error", "detail": "the AI did not answer"}
+        with self.ai_lock:
+            self._ai = {**res, "t": time.monotonic()}
 
     def prepare(self, sess: Session) -> None:
         if self.public.enabled:
@@ -159,7 +185,8 @@ class App:
             except (OSError, ValueError):
                 pass
         out = {"ok": True, "version": VERSION, "gemini_key_present": gemini_key() is not None,
-               "ollama_models": ollama, "fallback": "basic parser (always available)", "public": self.public.enabled}
+               "ollama_models": ollama, "fallback": "basic parser (always available)", "public": self.public.enabled,
+               "ai_status": self.ai_status()}
         if self.public.enabled:
             out["ai_budget_left"] = self.budget.left()
         self._health = (now, out)

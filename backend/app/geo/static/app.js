@@ -597,10 +597,14 @@ async function pollHealth() {
     if (S && S.config.mode === 'classic') { t = 'Basic parser (no AI)'; k = 'warn'; }
     else if (!hl.gemini_key_present && !(hl.ollama_models || []).length) { t = 'AI not configured: basic parser'; k = 'warn'; }
     else if (hl.public && hl.ai_budget_left === 0) { t = 'AI limit for today reached: basic parser'; k = 'warn'; }
+    else if (hl.ai_status && hl.ai_status.state === 'key_rejected') { t = 'AI key rejected: basic parser'; k = 'warn'; }
+    else if (hl.ai_status && hl.ai_status.state === 'quota') { t = 'AI quota used up: basic parser'; k = 'warn'; }
+    else if (hl.ai_status && hl.ai_status.state === 'error') { t = 'AI not answering: basic parser'; k = 'warn'; }
+    else if (hl.ai_status && hl.ai_status.state === 'checking') { t = 'Checking the AI…'; k = ''; }
     else { t = hl.public ? 'AI ready · ' + hl.ai_budget_left + ' calls left today' : 'AI ready'; k = 'ok'; }
     c.textContent = t; c.className = 'chip ' + k;
   } catch (e) { /* the stale banner already reports a lost connection */ }
-  setTimeout(pollHealth, 30000);
+  setTimeout(pollHealth, (document.getElementById('aichip').textContent.startsWith('Checking')) ? 4000 : 30000);
 }
 async function pollLoop() { await poll(); setTimeout(pollLoop, 250); }
 
