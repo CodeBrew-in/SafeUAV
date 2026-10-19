@@ -609,7 +609,7 @@ async function pollHealth() {
   } catch (e) { /* the stale banner already reports a lost connection */ }
   setTimeout(pollHealth, (document.getElementById('aichip').textContent.startsWith('Checking')) ? 4000 : 30000);
 }
-async function pollLoop() { await poll(); setTimeout(pollLoop, 250); }
+async function pollLoop() { await poll(); setTimeout(pollLoop, document.hidden ? 2000 : (MAP.public ? 700 : 250)); }   // the free host has little CPU
 
 // ---------------------------------------------------------------- animation loop
 let lastT = performance.now(), lastBase = 0;
@@ -650,7 +650,7 @@ async function init() {
     e.preventDefault(); const t = $('chatin').value.trim(); if (!t) return;
     try { await api('/api/chat', { text: t }); $('chatin').value = ''; busySince = performance.now(); poll(); } catch (err) { showReject(err.message); }
   };
-  setInterval(() => { if (!document.hidden && lastOk && performance.now() - lastOk > 5000) { $('stale').textContent = 'Connection lost: view frozen.'; $('stale').classList.remove('hidden'); } }, 1000);
+  setInterval(() => { if (!document.hidden && lastOk && performance.now() - lastOk > (MAP.public ? 15000 : 5000)) { $('stale').textContent = 'Connection lost: view frozen.'; $('stale').classList.remove('hidden'); } }, 1000);
   pollLoop(); pollHealth(); requestAnimationFrame(frame);
 }
 init().catch(e => { document.body.prepend(h('div', { class: 'tag' }, 'Could not start: ' + e.message)); });

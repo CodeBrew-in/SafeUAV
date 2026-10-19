@@ -735,3 +735,49 @@ def test_the_fallback_message_says_why_without_leaking_a_key():
     s.handle("also inspect the directorate")
     text = [c["text"] for c in s.chat if c["who"] == "ai"][-1]
     assert "400" in text and "AIza" not in text and "https://" not in text and "basic parser used" in text
+
+
+class Scripted:
+    """Answers with the next canned reply and remembers every prompt it was shown."""
+    def __init__(self, replies):
+        self.replies, self.prompts = list(replies), []
+
+    def ask(self, system, user, schema, seed=0, max_tokens=0):
+        self.prompts.append(user)
+        d = self.replies.pop(0)
+        return LLMReply("fake", "fake", str(d), d, 1.0, None)
+
+
+def test_a_short_answer_to_the_ais_question_is_read_together_with_the_question():
+    ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Did you mean SBOP lawns?"}
+    llm = Scripted([ask, reply(["SBOP lawns"]), reply([LIB])])
+    s = sess(llm)
+    s.handle("go to sbop")
+    assert any(c.get("status") == "clarify" for c in s.chat) and s.desired.targets == ()
+    s.handle("yes")
+    assert "go to sbop" in llm.prompts[1] and "Did you mean SBOP lawns?" in llm.prompts[1] and '"yes"' in llm.prompts[1]
+    assert s.desired.targets == ("SBOP lawns",)
+    s.handle("yes")                                      # nothing is pending any more: no stale context
+    assert "go to sbop" not in llm.prompts[2]
+
+
+def test_a_long_new_order_after_a_question_is_a_new_order_and_reset_forgets_the_question():
+    ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Which one?"}
+    llm = Scripted([ask, reply([LIB])])
+    s = sess(llm)
+    s.handle("go to the hall")
+    s.handle("Forget that. Please inspect the Nava Nalanda Library and after that come back to the base pad, thanks a lot")
+    assert "go to the hall" not in llm.prompts[1]
+    llm2 = Scripted([ask, reply([LIB])])
+    s2 = sess(llm2)
+    s2.handle("go to the hall")
+    s2.reset()
+    s2.handle("yes")
+    assert "go to the hall" not in llm2.prompts[1]
+
+
+def test_offline_a_yes_after_a_question_uses_the_original_order_in_the_basic_parser():
+    s = sess(FakeLLM(error="URLError: refused"))
+    s.pending_clarify = {"orig": "go to sbop lawns", "question": "Question: Did you mean SBOP lawns?"}
+    s.handle("yes")
+    assert s.desired.targets == ("SBOP lawns",)

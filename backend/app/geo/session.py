@@ -41,6 +41,7 @@ LAND_AT = re.compile(r"^\s*(?:please\s+)?land\s+(?:and\s+(?:stop|stay|wait)\s+)?
 STAY_RE = re.compile(r"\b(?:don'?t|do not|never|no need to)\s+(?:return|go|come|fly)\s+(?:back|home|to\s+base)(?:\s+to\s+base)?\b"
                      r"|\b(?:stop|stay|remain|finish|end|wait)\s+(?:at|there|here)\b|\bland\s+and\s+(?:stop|stay)\b", re.I)
 DIVERT_RE = re.compile(r"\b(divert|detour|go first|first go|go now|right now|immediately|urgent)\b", re.I)
+YES_RE = re.compile(r"^\s*(yes|yeah|yep|yup|ok|okay|sure|correct|right|exactly|haan|ha|y)\W*$", re.I)
 ONLY_WORDS = re.compile(r"\b(only|instead)\b", re.I)
 HOLD_MAX_TICKS = 20      # the drone waits for the AI at most this many simulated seconds
 MAX_CHAT = 400
@@ -142,6 +143,7 @@ class Session:
         self._acc = 0.0                # real seconds * speed not yet turned into simulation ticks
         self.circles: list[dict] = []  # areas the operator drew: name, x, y, r
         self.circle_n = 0
+        self.pending_clarify: dict | None = None   # the AI's last question, so a short answer is read with it
         self._audit_seen = 0
         self._rebuild()
 
@@ -452,6 +454,7 @@ class Session:
             self.hold_ticks = self.chat_dropped = 0
             self.desired = self.draft
             self.chat, self.direct = [], None
+            self.pending_clarify = None
             self._rebuild()
 
     def _zone_spec(self) -> MissionSpec:
@@ -597,12 +600,17 @@ class Session:
             gen, epoch0 = self.gen, self.epoch
             self.token = token = int(time.monotonic() * 1e6) or 1
             self.hold_ticks = 0
+            ctx, self.pending_clarify = self.pending_clarify, None     # a question is answered once
             base = self.working_spec()
             visited = [self.campus.places[v].name for v in self.ctl.visited if v in self.campus.places]
             if self.ctl.state == "DONE":
                 visited = []
             hh, cfg, campus = self.ctl.hhmm(), self.cfg, self.campus
             self.say("operator", text)
+            ai_text, orig = text, text
+            if ctx and len(text) <= 80:        # "yes" / "the second one" answers the AI's question, not a new order
+                orig = ctx["orig"]
+                ai_text = f'{orig} (You asked: "{ctx["question"]}" The operator answered: "{text}")'
         try:
             if cfg.mode == "direct":
                 self._direct(text, hh, gen)
@@ -610,7 +618,7 @@ class Session:
             if land_raw:      # "land at <place>": the AI only has to find which place is meant
                 interp = self._interpret(f"inspect {land_raw}", MissionSpec(()), [], hh, cfg, campus)
             else:
-                interp = self._interpret(text, base, visited, hh, cfg, campus)
+                interp = self._interpret(ai_text, base, visited, hh, cfg, campus)
             with self.lock:
                 if gen != self.gen:
                     if self.epoch == epoch0:
@@ -619,7 +627,7 @@ class Session:
                 if land_raw:
                     self._apply_land(interp, land_raw)
                 else:
-                    self._apply_interp(interp, text, base)
+                    self._apply_interp(interp, text, base, orig)
         finally:
             with self.lock:
                 if self.token == token:
@@ -687,8 +695,9 @@ class Session:
             return
         self._land_at(place)
 
-    def _apply_interp(self, interp, text: str, base: MissionSpec) -> None:
+    def _apply_interp(self, interp, text: str, base: MissionSpec, orig: str | None = None) -> None:
         kind, r = interp
+        orig = orig or text
         try:
             if kind == "ai" and r.status == "keyword":
                 if not self.started:
@@ -706,12 +715,15 @@ class Session:
                 return
             if kind == "ai" and r.status in ("refused", "clarify"):
                 self.say("ai", r.message, status=r.status)
+                if r.status == "clarify":
+                    self.pending_clarify = {"orig": orig, "question": str(r.message)[:200]}
                 return
             # AI unavailable (error/timeout) or classic mode: the basic parser takes over
             fallback = kind == "ai"
             parser = RegexParser(self.campus)
-            targets, avoid, stay = parser.parse_parts(text, split_and=True)
-            stay = stay or bool(STAY_RE.search(text))
+            parse_text = orig if (orig != text and YES_RE.match(text)) else text
+            targets, avoid, stay = parser.parse_parts(parse_text, split_and=True)
+            stay = stay or bool(STAY_RE.search(parse_text))
             if not (targets or avoid or stay):
                 why = ("The AI is offline and the basic parser could not read that. Name a place (for example "
                        "\"inspect the library\"), or use the buttons on the map." if fallback
