@@ -625,3 +625,35 @@ def test_advance_turns_real_time_into_ticks_at_the_session_speed():
     s.set_speed(5)
     s.advance(1.0)
     assert s.ctl.t == t0 + 7
+
+
+# --- found by hand: "land at <not a pad>", "don't return home", friendly offline error -----------------
+
+@pytest.mark.parametrize("text", ["land at neeram hamll", "land and stop at neeram hall", "please land on the Neeram Hall"])
+def test_land_at_a_place_that_is_not_a_pad_is_explained_and_not_added_as_a_target(text):
+    class Boom:
+        def ask(self, *a, **k):
+            raise AssertionError("AI must not be called")
+    s = sess(Boom())
+    _fly(s)
+    before = s.desired.targets
+    s.handle(text)
+    assert s.desired.targets == before and s.phase == "FLYING"
+    assert any("not a landing pad" in c["text"] for c in s.chat if c["who"] == "system")
+    assert not s.safety_pending
+
+
+@pytest.mark.parametrize("text", ["dont return home", "don't return to base", "do not go back home", "go to the library and stop there"])
+def test_basic_parser_understands_staying_at_the_end(text):
+    s = sess(mode="classic")
+    s.edit("target_add", LIB)
+    s.handle(text)
+    assert s.desired.return_to_base is False
+
+
+def test_offline_ai_gives_a_friendly_message_not_a_stack_trace():
+    s = sess(FakeLLM(error="URLError: <urlopen error [WinError 10061] refused>"))
+    s.edit("target_add", LIB)
+    s.handle("make it so")
+    last = [c for c in s.chat if c["who"] == "ai"][-1]["text"]
+    assert "offline" in last and "WinError" not in last and "URLError" not in last

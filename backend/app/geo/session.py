@@ -37,7 +37,9 @@ MAX_AVOID = 20
 MAX_CIRCLES = 8
 CIRCLE_R = (20.0, 300.0)
 END_WORDS = re.compile(r"^\s*(please\s+)?(end|finish|stop|cancel)\s+(the\s+|this\s+)?(mission|flight)\W*$", re.I)
-LAND_AT = re.compile(r"^\s*(?:please\s+)?land\s+(?:at|on)\s+(?:the\s+)?(.+?)\W*$", re.I)
+LAND_AT = re.compile(r"^\s*(?:please\s+)?land\s+(?:and\s+(?:stop|stay|wait)\s+)?(?:at|on|in)\s+(?:the\s+)?(.+?)\W*$", re.I)
+STAY_RE = re.compile(r"\b(?:don'?t|do not|never|no need to)\s+(?:return|go|come|fly)\s+(?:back|home|to\s+base)(?:\s+to\s+base)?\b"
+                     r"|\b(?:stop|stay|remain|finish|end|wait)\s+(?:at|there|here)\b|\bland\s+and\s+(?:stop|stay)\b", re.I)
 ONLY_WORDS = re.compile(r"\b(only|instead)\b", re.I)
 HOLD_MAX_TICKS = 20      # the drone waits for the AI at most this many simulated seconds
 MAX_CHAT = 400
@@ -285,6 +287,16 @@ class Session:
             self.speed = speed
 
     # --- editing the mission --------------------------------------------------------------------
+    def _resolve_name(self, raw: str):
+        """A place from the operator's words: exact (normalised) match first, then a close spelling."""
+        import difflib
+        p = self.campus.find(raw)
+        if p is not None:
+            return p
+        names = {_k(pl.name): pl for pl in self.campus.places.values()}
+        hit = difflib.get_close_matches(_k(raw), list(names), n=1, cutoff=0.8)
+        return names[hit[0]] if hit else None
+
     def _place(self, name: str):
         p = self.campus.find(str(name))
         if p is None or p.name in self.campus.permanent_no_fly:
@@ -546,19 +558,23 @@ class Session:
                 except SessionError as e:
                     self.say("system", f"Not applied: {e}", level="bad")
             return
-        m = LAND_AT.match(text) if len(text) <= 60 else None
+        m = LAND_AT.match(text) if len(text) <= 70 else None
         if m:
-            pads = {_k(n): n for n in self.campus.pads}
-            pad = pads.get(_k(m.group(1)))
-            if pad is not None:
+            place = self._resolve_name(m.group(1))
+            if place is not None:                 # a known place: this is a landing order, never a target
                 with self.lock:
                     self.say("operator", text)
                     try:
-                        if not self.started:
-                            self.say("ai", "Nothing is flying yet.", status="keyword")
+                        if place.name in self.campus.pads:
+                            if not self.started:
+                                self.say("ai", "Nothing is flying yet.", status="keyword")
+                            else:
+                                self.emergency("land", place.name)
+                                self.say("ai", f"Landing at {place.name} (handled without the AI)", status="keyword")
                         else:
-                            self.emergency("land", pad)
-                            self.say("ai", f"Landing at {pad} (handled without the AI)", status="keyword")
+                            pads = ", ".join(sorted(self.campus.pads))
+                            self.say("system", f"{place.name} is not a landing pad, so the drone cannot land there. "
+                                     f"Pads: {pads}. Say \"land now\" for the nearest pad, or \"land at <pad>\".", level="bad")
                     except SessionError as e:
                         self.say("system", f"Not applied: {e}", level="bad")
                 return
@@ -637,8 +653,11 @@ class Session:
             fallback = kind == "ai"
             parser = RegexParser(self.campus)
             targets, avoid, stay = parser.parse_parts(text, split_and=True)
+            stay = stay or bool(STAY_RE.search(text))
             if not (targets or avoid or stay):
-                why = r.message if fallback else "I couldn't find a place name in that."
+                why = ("The AI is offline and the basic parser could not read that. Name a place (for example "
+                       "\"inspect the library\"), or use the buttons on the map." if fallback
+                       else "I couldn't find a place name in that.")
                 self.say("ai", why, status="error" if fallback else "clarify")
                 return
             cur = self.working_spec()
