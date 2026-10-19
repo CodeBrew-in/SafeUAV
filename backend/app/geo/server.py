@@ -27,7 +27,7 @@ from .spec import parse_time
 
 C = load_campus()
 STATIC = Path(__file__).with_name("static")
-MODELS = ["qwen2.5:3b", "qwen2.5:7b", "gemini-3.5-flash"]
+MODELS = ["qwen2.5:3b", "qwen2.5:7b", "gemini-3.5-flash-lite"]
 SPEED = 10.0  # simulated seconds per real second
 
 SCENARIOS = {

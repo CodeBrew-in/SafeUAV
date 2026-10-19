@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[3]
 RES = ROOT / "results" / "geo_benchmark.jsonl"
 DOC = ROOT / "docs" / "geo_results.md"
 PLOTS = ROOT / "experiments" / "plots"
-ORDER = ["gold", "regex", "qwen2.5:3b", "qwen2.5:7b", "gemini-3.5-flash"]
+ORDER = ["gold", "regex", "qwen2.5:3b", "qwen2.5:7b", "gemini-3.5-flash-lite"]
 
 
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
