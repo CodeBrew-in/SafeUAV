@@ -141,6 +141,8 @@ def classify_ai_error(err: str | None) -> tuple[str, str]:
     if not err:
         return "ok", ""
     e = err.lower()
+    if e.startswith(("invalid json", "empty response", "output cut off", "expected a json object")):
+        return "ok", ""            # the provider answered; only its reply was cut short or not JSON
     if "not set" in e:
         return "no_key", "no API key is set"
     if "daily ai limit" in e:

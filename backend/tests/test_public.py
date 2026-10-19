@@ -150,7 +150,7 @@ def test_local_mode_is_unchanged_and_listens_on_loopback_only():
         srv.server_close()
 
 
-@pytest.mark.parametrize("err,state", [(None, "ok"), ("GEMINI_API_KEY is not set", "no_key"), ("HTTP 401: nope", "key_rejected"),
+@pytest.mark.parametrize("err,state", [(None, "ok"), ("output cut off at the token limit; invalid JSON: x", "ok"), ("empty response", "ok"), ("GEMINI_API_KEY is not set", "no_key"), ("HTTP 401: nope", "key_rejected"),
                                        ("HTTP 403 forbidden", "key_rejected"), ("HTTP 429 too many", "quota"),
                                        ("the daily AI limit for this demo is used up", "budget"), ("boom", "error")])
 def test_ai_errors_are_classified_for_the_status_chip(err, state):
