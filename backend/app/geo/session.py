@@ -619,6 +619,19 @@ class Session:
                 interp = self._interpret(f"inspect {land_raw}", MissionSpec(()), [], hh, cfg, campus)
             else:
                 interp = self._interpret(ai_text, base, visited, hh, cfg, campus)
+                assumed = None
+                if interp[0] == "ai" and interp[1].status == "clarify":
+                    # The operator does not want questions: ask once more, telling the AI to pick the most likely place.
+                    # The pick is shown to the operator, and validation and the shield check it like any other order.
+                    names = [pl.name for pl in campus.places.values() if _k(pl.name) in _k(interp[1].message)]
+                    assumed = names[0] if len(names) == 1 else ""
+                    hint = f" It is probably {assumed}." if assumed else ""
+                    again = self._interpret(f"{ai_text} (Do not ask a question. Choose the single most likely place from "
+                                            f"the list.{hint})", base, visited, hh, cfg, campus)
+                    if again[0] == "ai" and again[1].status == "applied":
+                        interp = again
+                    else:
+                        assumed = None          # it still could not decide: the question is shown after all
             with self.lock:
                 if gen != self.gen:
                     if self.epoch == epoch0:
@@ -627,7 +640,7 @@ class Session:
                 if land_raw:
                     self._apply_land(interp, land_raw)
                 else:
-                    self._apply_interp(interp, text, base, orig)
+                    self._apply_interp(interp, text, base, orig, assumed)
         finally:
             with self.lock:
                 if self.token == token:
@@ -695,7 +708,7 @@ class Session:
             return
         self._land_at(place)
 
-    def _apply_interp(self, interp, text: str, base: MissionSpec, orig: str | None = None) -> None:
+    def _apply_interp(self, interp, text: str, base: MissionSpec, orig: str | None = None, assumed: str | None = None) -> None:
         kind, r = interp
         orig = orig or text
         try:
@@ -710,7 +723,8 @@ class Session:
                 new = merge_reply(base, r.command.spec, self.working_spec())
                 new = self._prioritize(new, base, text)
                 self._commit(new, source="chat", text=text)
-                self.say("ai", "Understood.", status="applied", spec=new.to_json(),
+                took = "" if assumed is None else (f" I took that to mean {assumed}." if assumed else " I picked the most likely match.")
+                self.say("ai", "Understood." + took, status="applied", spec=new.to_json(),
                          latency_ms=None if r.latency_ms is None else round(r.latency_ms))
                 return
             if kind == "ai" and r.status in ("refused", "clarify"):

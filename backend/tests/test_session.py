@@ -750,30 +750,30 @@ class Scripted:
 
 def test_a_short_answer_to_the_ais_question_is_read_together_with_the_question():
     ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Did you mean SBOP lawns?"}
-    llm = Scripted([ask, reply(["SBOP lawns"]), reply([LIB])])
+    llm = Scripted([ask, ask, reply(["SBOP lawns"]), reply([LIB])])      # the AI insists on asking, twice
     s = sess(llm)
     s.handle("go to sbop")
     assert any(c.get("status") == "clarify" for c in s.chat) and s.desired.targets == ()
     s.handle("yes")
-    assert "go to sbop" in llm.prompts[1] and "Did you mean SBOP lawns?" in llm.prompts[1] and '"yes"' in llm.prompts[1]
+    assert "go to sbop" in llm.prompts[2] and "Did you mean SBOP lawns?" in llm.prompts[2] and '"yes"' in llm.prompts[2]
     assert s.desired.targets == ("SBOP lawns",)
     s.handle("yes")                                      # nothing is pending any more: no stale context
-    assert "go to sbop" not in llm.prompts[2]
+    assert "go to sbop" not in llm.prompts[3]
 
 
 def test_a_long_new_order_after_a_question_is_a_new_order_and_reset_forgets_the_question():
     ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Which one?"}
-    llm = Scripted([ask, reply([LIB])])
+    llm = Scripted([ask, ask, reply([LIB])])
     s = sess(llm)
     s.handle("go to the hall")
     s.handle("Forget that. Please inspect the Nava Nalanda Library and after that come back to the base pad, thanks a lot")
-    assert "go to the hall" not in llm.prompts[1]
-    llm2 = Scripted([ask, reply([LIB])])
+    assert "go to the hall" not in llm.prompts[2]
+    llm2 = Scripted([ask, ask, reply([LIB])])
     s2 = sess(llm2)
     s2.handle("go to the hall")
     s2.reset()
     s2.handle("yes")
-    assert "go to the hall" not in llm2.prompts[1]
+    assert "go to the hall" not in llm2.prompts[2]
 
 
 def test_offline_a_yes_after_a_question_uses_the_original_order_in_the_basic_parser():
@@ -781,3 +781,31 @@ def test_offline_a_yes_after_a_question_uses_the_original_order_in_the_basic_par
     s.pending_clarify = {"orig": "go to sbop lawns", "question": "Question: Did you mean SBOP lawns?"}
     s.handle("yes")
     assert s.desired.targets == ("SBOP lawns",)
+
+
+def test_no_clarifying_question_the_ai_is_asked_again_to_pick_and_the_pick_is_shown():
+    ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Did you mean SBOP lawns?"}
+    llm = Scripted([ask, reply(["SBOP lawns"])])
+    s = sess(llm)
+    s.handle("go to sbop")
+    assert s.desired.targets == ("SBOP lawns",)
+    assert not any(c.get("status") == "clarify" for c in s.chat)              # no question reached the operator
+    assert "Do not ask a question" in llm.prompts[1] and "probably SBOP lawns" in llm.prompts[1]
+    last = [c for c in s.chat if c["who"] == "ai"][-1]["text"]
+    assert "I took that to mean SBOP lawns" in last                           # the assumption is visible
+
+
+def test_a_pick_is_still_validated_the_jail_is_never_chosen_by_guessing():
+    ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Did you mean Central Jail Patiala?"}
+    llm = Scripted([ask, reply(["Central Jail Patiala"])])
+    s = sess(llm)
+    s.handle("go to the jail")
+    assert s.desired.targets == ()
+    assert any(c["who"] == "system" and c.get("level") == "bad" for c in s.chat)   # the shield said no
+
+
+def test_if_the_ai_still_cannot_decide_the_question_is_shown():
+    ask = {"targets": [], "avoid": [], "stay_at_end": False, "refuse": False, "reason": "", "clarify": "Which one?"}
+    s = sess(Scripted([ask, ask]))
+    s.handle("go to the hall")
+    assert any(c.get("status") == "clarify" for c in s.chat) and s.pending_clarify
