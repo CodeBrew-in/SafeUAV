@@ -55,7 +55,9 @@ def key_of(r) -> str:
 
 
 def load():
-    rows = [json.loads(x) for x in RES.read_text(encoding="utf-8").splitlines() if x.strip()]
+    rows = []
+    for f in sorted(RES.parent.glob("geo_benchmark*.jsonl")):  # local run + Gemini run
+        rows += [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines() if x.strip()]
     return [r for r in rows if not r.get("skipped")]
 
 
