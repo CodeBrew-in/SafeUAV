@@ -1,0 +1,21 @@
+# Render Blueprint for the SafeUAV public demo (free plan). See docs/deploy_render.md.
+services:
+  - type: web
+    name: safeuav
+    runtime: python
+    plan: free
+    region: singapore          # closest Render region to India
+    branch: main
+    autoDeployTrigger: commit  # every push to main redeploys
+    buildCommand: pip install -r requirements.txt
+    startCommand: cd backend && python -m app.geo.server
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION    # the version the tests and the benchmark ran on
+        value: 3.12.7
+      - key: SAFEUAV_PUBLIC    # public-demo mode: public host only, rate limits, daily AI budget
+        value: "1"
+      - key: SAFEUAV_AI_DAILY_BUDGET
+        value: "200"           # AI calls per day for all visitors together; then the basic parser answers
+      - key: GEMINI_API_KEY    # secret: paste it in the Render dashboard when asked, never in this file
+        sync: false

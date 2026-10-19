@@ -138,3 +138,7 @@ label.f input, label.f select { font: inherit; padding: 4px 6px; border: 1px sol
 #downloads { flex-wrap: wrap; margin-bottom: 8px; }
 .attrib { margin-left: auto; color: var(--muted); font-size: 11px; }
 @media (max-width: 1000px) { #legend { display: none; } }
+.chip { font-size: 13px; font-weight: 600; padding: 3px 10px; border-radius: 99px; background: #fff; border: 1px solid var(--line); }
+.chip.ok { color: #0b5a2b; border-color: #86d4a5; }
+.chip.warn { color: #7a3d00; border-color: #f2c06b; background: #fff7e6; }
+.chip.hidden { display: none; }

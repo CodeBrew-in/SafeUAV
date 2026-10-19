@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, urlsplit
 from .basemap import build_basemap
 from .flight import AVOID_BUFFER
 from .llm import gemini_key
+from .public import AiBudget, BudgetLLM, Limiter, PublicConfig, PublicConfigError, from_env
 from .session import MODELS, MODES, SPEEDS, Session, SessionError
 from .version import VERSION
 
@@ -54,22 +55,42 @@ DRONE_ID = re.compile(r"[0-9a-f]{32}")
 LOG_TYPES = {"audit.jsonl": "application/x-ndjson", "track.csv": "text/csv; charset=utf-8", "report.html": "text/html; charset=utf-8"}
 
 
+class TooMany(SessionError):
+    """A rate limit was hit (HTTP 429)."""
+
+
 class App:
     """Everything a request handler needs, so tests can build their own.
 
     One drone per browser tab: the page sends its own random id (X-Drone-Id, kept in sessionStorage), and
     each id gets its own Session. A request without an id uses the default session (tests, curl)."""
 
-    def __init__(self, session: Session | None = None, defaults: dict | None = None):
+    def __init__(self, session: Session | None = None, defaults: dict | None = None, public: PublicConfig | None = None):
         self.defaults = defaults or {}           # from safeuav.toml; applied to every new drone
+        self.public = public or PublicConfig()
+        self.limiter = Limiter()
+        self.budget = AiBudget(self.public.ai_daily_budget)
+        self.max_drones = self.public.max_drones if self.public.enabled else MAX_DRONES
         self.session = session or Session()
-        self.apply_defaults(self.session)
+        if self.public.enabled:                  # every AI call spends from one daily budget
+            inner = self.session.llm_factory
+            self.session.llm_factory = lambda model: BudgetLLM(inner(model), self.budget)
+        self.prepare(self.session)
         self.drones: dict[str, list] = {}       # id -> [Session, last_seen]
         self.drone_lock = threading.Lock()
         self.token = secrets.token_urlsafe(24)
         self.port = 0
         self.slots = threading.BoundedSemaphore(MAX_THREADS)
         self._health: tuple[float, dict] | None = None
+
+    def prepare(self, sess: Session) -> None:
+        if self.public.enabled:
+            sess.models = [m for m in MODELS if m.startswith("gemini")]
+        self.apply_defaults(sess)
+
+    def check(self, kind: str, who: str, limit: int, window_s: float) -> None:
+        if self.public.enabled and not self.limiter.allow(kind, who, limit, window_s):
+            raise TooMany("Too many requests. Please wait a moment and try again.")
 
     def apply_defaults(self, sess: Session) -> None:
         for k, v in self.defaults.items():
@@ -84,13 +105,13 @@ class App:
         with self.drone_lock:
             entry = self.drones.get(drone_id)
             if entry is None:
-                if len(self.drones) >= MAX_DRONES:
+                if len(self.drones) >= self.max_drones:
                     idle = min(self.drones.items(), key=lambda kv: kv[1][1])
                     if now - idle[1][1] < 60:
                         raise SessionError("All demo drones are busy. Try again in a minute.")
                     del self.drones[idle[0]]
                 fresh = Session(llm_factory=self.session.llm_factory, campus=self.session.base_campus)
-                self.apply_defaults(fresh)
+                self.prepare(fresh)
                 entry = self.drones[drone_id] = [fresh, now]
             entry[1] = now
             return entry[0]
@@ -106,10 +127,13 @@ class App:
                 del self.drones[k]
 
     def hosts(self) -> set[str]:
+        if self.public.enabled:
+            return {self.public.host}
         return {f"127.0.0.1:{self.port}", f"localhost:{self.port}"}
 
     def origins(self) -> set[str]:
-        return {f"http://{h}" for h in self.hosts()}
+        scheme = "https" if self.public.enabled else "http"
+        return {f"{scheme}://{h}" for h in self.hosts()}
 
     def map_payload(self) -> dict:
         c = self.session.base_campus
@@ -119,7 +143,7 @@ class App:
                         "poly": [[round(x, 1), round(y, 1)] for x, y in p.polygon]} for k, p in c.places.items()],
             "no_fly": [{"name": n, "poly": [[round(x, 1), round(y, 1)] for x, y in poly], "buffer": b}
                        for n, (poly, b) in c.permanent_no_fly.items()],
-            "models": MODELS, "modes": MODES, "speeds": SPEEDS, "presets": PRESETS,
+            "models": self.session.models, "public": self.public.enabled, "modes": MODES, "speeds": SPEEDS, "presets": PRESETS,
             "avoid_buffer": AVOID_BUFFER, "version": VERSION,
         }
 
@@ -128,13 +152,16 @@ class App:
         if self._health and now - self._health[0] < 15:
             return self._health[1]
         ollama = []
-        try:
-            with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1.0) as r:
-                ollama = [m["name"] for m in json.loads(r.read().decode()).get("models", [])]
-        except (OSError, ValueError):
-            pass
+        if not self.public.enabled:
+            try:
+                with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=1.0) as r:
+                    ollama = [m["name"] for m in json.loads(r.read().decode()).get("models", [])]
+            except (OSError, ValueError):
+                pass
         out = {"ok": True, "version": VERSION, "gemini_key_present": gemini_key() is not None,
-               "ollama_models": ollama, "fallback": "basic parser (always available)"}
+               "ollama_models": ollama, "fallback": "basic parser (always available)", "public": self.public.enabled}
+        if self.public.enabled:
+            out["ai_budget_left"] = self.budget.left()
         self._health = (now, out)
         return out
 
@@ -158,6 +185,8 @@ def make_handler(app: App):
                              "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Referrer-Policy", "no-referrer")
+            if app.public.enabled:
+                self.send_header("Strict-Transport-Security", "max-age=31536000")
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
@@ -184,6 +213,8 @@ def make_handler(app: App):
                 return self._deny(503, "busy")
             try:
                 fn()
+            except TooMany as e:
+                self._deny(429, str(e))
             except SessionError as e:
                 self._deny(400, str(e))
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
@@ -201,7 +232,17 @@ def make_handler(app: App):
         def do_GET(self):
             self._guarded(self._get)
 
+        def _client_ip(self) -> str:
+            """The caller's address. Behind the host's proxy the last X-Forwarded-For entry is the one the proxy added."""
+            if app.public.enabled:
+                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+                if fwd:
+                    return fwd[:64]
+            return self.client_address[0]
+
         def _get(self):
+            if urlsplit(self.path).path == "/healthz":      # for the host's health check: no data, no token
+                return self._send(200, b"ok", "text/plain; charset=utf-8")
             if not self._origin_ok():
                 return self._deny(403, "bad host or origin")
             url = urlsplit(self.path)
@@ -283,6 +324,8 @@ def make_handler(app: App):
                 return
             s, path = app.session_for(self.headers.get("X-Drone-Id")), self.path.split("?")[0]
             if path == "/api/chat":
+                app.check("chat-drone", self.headers.get("X-Drone-Id") or "default", app.public.chat_per_min, 60)
+                app.check("chat-ip", self._client_ip(), app.public.chat_per_ip_min, 60)
                 from .operator import strict_keyword
                 from .session import END_WORDS
                 if not isinstance(body.get("text", ""), str):
@@ -311,6 +354,8 @@ def make_handler(app: App):
                 if not isinstance(op, str):
                     return self._deny(400, "missing op")
                 return self._json({"ok": True, "message": s.edit(op, body.get("place"), body.get("value"))})
+            if path == "/api/start":
+                app.check("start-ip", self._client_ip(), app.public.starts_per_hour, 3600)
             simple = {"/api/start": s.start, "/api/pause": s.pause, "/api/resume": s.resume, "/api/reset": s.reset,
                       "/api/end": s.end_mission}
             if path in simple:
@@ -369,7 +414,8 @@ class Server(ThreadingHTTPServer):
 
 
 def make_server(app: App, port: int = 0) -> ThreadingHTTPServer:
-    srv = Server(("127.0.0.1", port), make_handler(app))  # loopback only, never 0.0.0.0
+    # loopback only; only the explicit public mode (switched on by the host's environment) listens on all addresses
+    srv = Server((app.public.bind if app.public.enabled else "127.0.0.1", port), make_handler(app))
     app.port = srv.server_address[1]
     return srv
 
@@ -404,14 +450,16 @@ def main(port: int | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         cfg = load()
-        app = App(defaults=cfg["session"])
-    except (SettingsError, SessionError) as e:
+        pub = from_env()
+        app = App(defaults=cfg["session"], public=pub)
+    except (SettingsError, SessionError, PublicConfigError) as e:
         raise SystemExit(f"Settings problem: {e}")
-    srv = make_server(app, port or cfg["port"])
+    srv = make_server(app, port or (pub.port if pub.enabled else cfg["port"]))
     stop = threading.Event()
     threading.Thread(target=sim_loop, args=(app, stop), daemon=True).start()
     h = app.health()
-    print(f"SafeUAV console v{VERSION}  http://127.0.0.1:{app.port}", flush=True)
+    where = f"https://{pub.host} (public demo, listening on port {app.port})" if pub.enabled else f"http://127.0.0.1:{app.port}"
+    print(f"SafeUAV console v{VERSION}  {where}", flush=True)
     print(f"  AI: gemini key {'found' if h['gemini_key_present'] else 'NOT set'}; "
           f"local models: {', '.join(h['ollama_models']) or 'none reachable'}; basic parser always available", flush=True)
     try:

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.5 - Phase 3.5: public demo
+
+- Public mode (`SAFEUAV_PUBLIC=1`): public host only, HTTPS origins, HSTS, listens on the host's `PORT`, `/healthz`.
+- Rate limits (chat per drone and per address, flight starts per address, drone cap) and one daily AI budget with an automatic fall-back
+  to the basic parser. The page shows an AI status chip and a "public demo" tag.
+- Only the hosted AI is offered in public mode; local models are not.
+- Render blueprint (`render.yaml`) and a deploy guide (`docs/deploy_render.md`).
+- Fixes from hand testing: AI-read spelling in "land at <place>", "divert to X", "don't return home", End mission drops unreached targets,
+  ragged building footprints are clickable, Space works after a button click.
+
 ## 0.3.0 - Phase 3: the console
 
 - A local web console: vector map of the Thapar campus (OpenStreetMap), pan/zoom, click cards, drawn round areas,

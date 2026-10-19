@@ -123,6 +123,7 @@ class Session:
         self.base_campus = campus or load_campus()
         self.llm_factory = llm_factory or self._default_llm
         self.cfg = Config()
+        self.models = list(MODELS)     # the public demo narrows this to the hosted AI only
         self.speed = DEFAULT_SPEED
         self.draft = MissionSpec(())
         self.desired = self.draft
@@ -249,7 +250,7 @@ class Session:
                         raise SessionError(f"{k.replace('_', ' ').capitalize()} must be a number.")
                 elif k in ("monitor", "wait_for_ai") and not isinstance(v, bool):
                     raise SessionError(f"{k} must be true or false.")
-                if k == "model" and v in MODELS:
+                if k == "model" and v in self.models:
                     cfg.model = v
                 elif k == "mode" and v in MODES:
                     cfg.mode = v
@@ -272,7 +273,7 @@ class Session:
                         raise SessionError("The base must be one of the landing pads.")
                     cfg.base_pad = v
                 elif k == "model":
-                    raise SessionError("Model must be one of: " + ", ".join(MODELS))
+                    raise SessionError("Model must be one of: " + ", ".join(self.models))
                 elif k == "mode":
                     raise SessionError("Mode must be one of: " + ", ".join(MODES))
                 else:

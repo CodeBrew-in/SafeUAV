@@ -74,3 +74,25 @@ accounts. Each browser tab gets its own drone (`X-Drone-Id`, kept in `sessionSto
 - The AI's free text (reasons, questions) is shown to the operator. A manipulated model could write
   misleading advice there; it cannot change the flight rules.
 - The server is a single-process teaching server, not a production service.
+
+## Public demo mode (Phase 3.5)
+
+Switched on only by `SAFEUAV_PUBLIC=1` on the host. Local use is unchanged (127.0.0.1 only).
+
+| Attack or failure | Control | Test |
+|---|---|---|
+| Another site or host name talks to the public server | Only the configured public host is accepted; origins must be `https://<host>`; HSTS | `test_only_the_public_host_is_accepted_and_hsts_is_sent` |
+| A visitor burns the shared AI quota | One daily budget for all AI calls; when spent, the basic parser answers and the page says so | `test_the_daily_ai_budget_runs_out_and_the_session_falls_back` |
+| Message or flight spam | Per-drone and per-address chat limits, per-address flight-start limit (HTTP 429), drone cap, connection cap | `test_chat_rate_limit_per_drone_and_drone_cap`, `test_starts_per_hour_limit_by_client_address` |
+| Visitors reach local models or the server's own services | Public mode offers only the hosted model, skips the local-model probe | `test_public_page_data_has_the_hosted_model_only_and_the_budget_in_health` |
+| Mis-set environment on the host | Values are validated; public mode refuses to start without a host name | `test_env_config_is_validated` |
+| API key leaks | Held only as a host secret; never in files, state, health or logs | `test_state_never_contains_the_token_or_a_key` |
+| Health check abused | `/healthz` returns the word `ok` and nothing else | `test_healthz_needs_no_token_and_leaks_nothing` |
+
+**Accepted limits of the public demo**
+
+- Anyone who opens the page gets the API token, so the token only blocks other websites. The rate limits and the AI budget are the real
+  protection against abuse.
+- The client address comes from the host's proxy header (the last entry). Many people behind one network share one address and one limit.
+- Free hosting sleeps when idle and clears all drones when it restarts. There is no database and no accounts.
+- The AI budget is counted per server process; a restart resets the day's count. Keep the budget below your real API quota.

@@ -50,6 +50,11 @@ If the AI is down or slow, the basic parser takes over and the chat says so. It 
 [docs/demo_script.md](docs/demo_script.md) walks through a flight, a mid-flight change, an attack message,
 an impossible order, and the downloads.
 
+## Put it on the internet (free)
+
+A public demo link on Render: see [docs/deploy_render.md](docs/deploy_render.md). It uses your Gemini key as a host secret, shares a daily
+AI budget between visitors, rate-limits chat and flights, and falls back to the basic parser when the budget is used up.
+
 ## How it stays safe
 
 ```

@@ -174,6 +174,7 @@ function loadMap(m, basemap) {
   placeByName = Object.fromEntries(places.map(p => [p.name, p]));
   hatchNoFly = hatchPattern('#d92d20'); hatchAvoid = hatchPattern('#ee7a00');
   $('ver').textContent = 'v' + m.version;
+  if (m.public) $('pubnote').classList.remove('hidden');
   resize(); fitView();
 }
 function syncCircles(list) {
@@ -589,6 +590,18 @@ async function doPoll() {
     $('stale').textContent = (e instanceof TypeError ? 'Display error: ' : 'Connection lost: view frozen. ') + e.message; $('stale').classList.remove('hidden');
   }
 }
+async function pollHealth() {
+  try {
+    const hl = await api('/api/health'), c = $('aichip');
+    let t, k;
+    if (S && S.config.mode === 'classic') { t = 'Basic parser (no AI)'; k = 'warn'; }
+    else if (!hl.gemini_key_present && !(hl.ollama_models || []).length) { t = 'AI not configured: basic parser'; k = 'warn'; }
+    else if (hl.public && hl.ai_budget_left === 0) { t = 'AI limit for today reached: basic parser'; k = 'warn'; }
+    else { t = hl.public ? 'AI ready · ' + hl.ai_budget_left + ' calls left today' : 'AI ready'; k = 'ok'; }
+    c.textContent = t; c.className = 'chip ' + k;
+  } catch (e) { /* the stale banner already reports a lost connection */ }
+  setTimeout(pollHealth, 30000);
+}
 async function pollLoop() { await poll(); setTimeout(pollLoop, 250); }
 
 // ---------------------------------------------------------------- animation loop
@@ -631,6 +644,6 @@ async function init() {
     try { await api('/api/chat', { text: t }); $('chatin').value = ''; busySince = performance.now(); poll(); } catch (err) { showReject(err.message); }
   };
   setInterval(() => { if (!document.hidden && lastOk && performance.now() - lastOk > 5000) { $('stale').textContent = 'Connection lost: view frozen.'; $('stale').classList.remove('hidden'); } }, 1000);
-  pollLoop(); requestAnimationFrame(frame);
+  pollLoop(); pollHealth(); requestAnimationFrame(frame);
 }
 init().catch(e => { document.body.prepend(h('div', { class: 'tag' }, 'Could not start: ' + e.message)); });
