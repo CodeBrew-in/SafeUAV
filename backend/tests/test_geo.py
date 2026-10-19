@@ -312,3 +312,31 @@ def test_escape_never_ends_in_a_pocket_the_planner_cannot_leave():
     ctl = run_script(C, capacity_wh=40, forecast=CALM, actual=CALM, clock_min=600,
                      initial=MissionSpec(("Venture Lab",)), changes=[(40, Command("order", new, "x"))])
     assert ctl.state == "DONE" and ctl.visited == ["venturelab", "directorate"]
+
+
+def test_grid_cache_key_uses_geometry_not_names():
+    # regression: same zone name, different shape, must not reuse a stale blocked grid
+    import dataclasses
+    from app.geo import flight
+    from app.geo.flight import GridPlanner
+
+    def air(poly):
+        return Airspace(C, [("zone-1", poly, AVOID_BUFFER)])
+
+    a = air([(-500, -100), (-400, -100), (-400, 0), (-500, 0)])
+    b = air([(100, 100), (200, 100), (200, 200), (100, 200)])
+    assert a.key() != b.key()
+    ga, gb = GridPlanner(a), GridPlanner(b)
+    assert ga.blocked is not gb.blocked
+    assert ga.blocked[ga.cell_of((-450, -50))[0]][ga.cell_of((-450, -50))[1]]
+    assert not gb.blocked[gb.cell_of((-450, -50))[0]][gb.cell_of((-450, -50))[1]]
+    # a copy of the campus with a different permanent zone gets a different key
+    small = dataclasses.replace(C, permanent_no_fly={})
+    assert Airspace(small).key() != Airspace(C).key()
+
+
+def test_grid_cache_is_bounded():
+    from app.geo import flight
+    for i in range(flight._GRID_CACHE_MAX + 8):
+        flight.GridPlanner(Airspace(C, [(f"z{i}", [(i, 0), (i + 20, 0), (i + 20, 20), (i, 20)], AVOID_BUFFER)]))
+    assert len(flight._GRID_CACHE) <= flight._GRID_CACHE_MAX

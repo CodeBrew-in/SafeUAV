@@ -7,8 +7,11 @@ vector per flight. Ground speed along a leg follows from the wind triangle.
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import math
+import threading
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from .campus import Campus
@@ -104,8 +107,16 @@ class Airspace:
                     polys.append((p.name, list(p.polygon), AVOID_BUFFER))
         return cls(campus, polys)
 
-    def key(self) -> tuple:
-        return tuple(sorted(n for n, _, _ in self.avoid_polys))
+    def key(self) -> str:
+        """Cache key from the GEOMETRY that decides what is blocked (fence, permanent zones, avoid zones),
+        never from names or object ids: two different shapes with the same name must not share a grid."""
+        h = hashlib.sha256()
+        h.update(repr([round(v, 3) for v in self.campus.fence]).encode())
+        for name, (poly, buf) in sorted(self.campus.permanent_no_fly.items()):
+            h.update(repr((name, buf, [(round(x, 3), round(y, 3)) for x, y in poly])).encode())
+        for name, poly, buf in sorted(self.avoid_polys, key=lambda a: a[0]):
+            h.update(repr((name, buf, [(round(x, 3), round(y, 3)) for x, y in poly])).encode())
+        return h.hexdigest()
 
     def violation(self, p: Point, extra: float = 0.0, *, mission: bool = True) -> str | None:
         """Why p is forbidden (each buffer grown by `extra`), or None.
@@ -132,7 +143,9 @@ class Airspace:
 
 # --- planner -------------------------------------------------------------------------------------------
 
-_GRID_CACHE: dict[tuple, list[list[bool]]] = {}
+_GRID_CACHE: "OrderedDict[str, list[list[bool]]]" = OrderedDict()  # LRU, shared by the sim and API threads
+_GRID_CACHE_MAX = 32
+_GRID_LOCK = threading.Lock()
 
 
 class GridPlanner:
@@ -148,11 +161,19 @@ class GridPlanner:
         x0, y0, x1, y1 = airspace.campus.fence
         self.x0, self.y0 = x0, y0
         self.nx, self.ny = int((x1 - x0) // CELL) + 1, int((y1 - y0) // CELL) + 1
-        key = (id(airspace.campus), airspace.key())
-        if key not in _GRID_CACHE:
-            _GRID_CACHE[key] = [[airspace.violation(self.center((i, j)), PLAN_MARGIN) is not None
-                                 for j in range(self.ny)] for i in range(self.nx)]
-        self.blocked = _GRID_CACHE[key]
+        key = airspace.key()
+        with _GRID_LOCK:
+            grid = _GRID_CACHE.get(key)
+            if grid is not None:
+                _GRID_CACHE.move_to_end(key)
+        if grid is None:  # built outside the lock; a duplicate build is harmless
+            grid = [[airspace.violation(self.center((i, j)), PLAN_MARGIN) is not None
+                     for j in range(self.ny)] for i in range(self.nx)]
+            with _GRID_LOCK:
+                _GRID_CACHE[key] = grid
+                while len(_GRID_CACHE) > _GRID_CACHE_MAX:
+                    _GRID_CACHE.popitem(last=False)
+        self.blocked = grid
 
     def center(self, c: tuple[int, int]) -> Point:
         return (self.x0 + c[0] * CELL, self.y0 + c[1] * CELL)
