@@ -13,12 +13,28 @@ world, without needlessly reducing mission completion.
 | 1 | Grid simulator, A\*, safety shield, run pipeline, tests | done |
 | 2 | Local LLM planner (Ollama, `qwen2.5:3b`), wired into shield + fallback | done |
 | 2b | Core correctness pass: stress tests, paired arms, honest metrics (committee-reviewed) | done |
-| 3 | 60-scenario benchmark, results and analysis | next |
-| 4 | Methodology, limitations, report | — |
+| 3 | 60-scenario benchmark, results and analysis | done |
+| 4 | Methodology, limitations, report | done |
+| **P2** | **Real Thapar campus: plain-English orders, mid-flight changes, safe-hold, attacks, local UI** | **done** |
 | 5 | API + website (React + TypeScript) | later |
 | 6 | Deployment | later |
 
-## How it works
+## Phase 2: real campus, plain-English orders
+
+The AI understands the order, the algorithm plans it, the shield guarantees safety, and no chat message can change the safety rules.
+
+- Report: [docs/geo_report.md](docs/geo_report.md)
+- Full tables: [docs/geo_results.md](docs/geo_results.md)
+- Threat model: [docs/threat_model.md](docs/threat_model.md)
+
+Try it locally:
+
+```
+cd backend
+../.venv/Scripts/python -m app.geo.server   # then open http://127.0.0.1:8000
+```
+
+## How it works (phase 1, grid world)
 
 ```
 mission ──► planner proposal ──► safety shield ──► simulator ──► recorded run
