@@ -262,8 +262,14 @@ class GeminiLLM:
                 if e.code in (429, 500, 503) and attempt < 3:
                     time.sleep(min(60, 10 * (attempt + 1)))
                     continue
+                detail = ""
+                try:      # Google explains the refusal in the body ("API key not valid", "service blocked", ...)
+                    body = json.loads(e.read().decode("utf-8", "replace")[:4000]).get("error", {})
+                    detail = f" {body.get('status', '')}: {body.get('message', '')}".rstrip(": ")[:200]
+                except Exception:
+                    pass
                 return LLMReply(self.provider, self.model, None, None, (time.perf_counter() - t_total) * 1000,
-                                f"HTTP {e.code}", attempts)
+                                f"HTTP {e.code}{detail}", attempts)
             except (OSError, ValueError, http.client.HTTPException) as e:
                 return LLMReply(self.provider, self.model, None, None, (time.perf_counter() - t_total) * 1000,
                                 f"{type(e).__name__}: {e}"[:300], attempts)

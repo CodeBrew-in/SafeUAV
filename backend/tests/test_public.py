@@ -174,3 +174,20 @@ def test_the_ai_self_check_reports_a_rejected_key_in_health():
     assert st["state"] == "key_rejected"
     assert "AIza" not in json.dumps(st)
     assert app.health()["ai_status"]["state"] in ("key_rejected", "checking")
+
+
+def test_gemini_http_errors_carry_googles_reason_without_the_key(monkeypatch):
+    import io
+    import urllib.error
+    from app.geo import llm as llm_mod
+    monkeypatch.setenv("GEMINI_API_KEY", "AQ.testkeyvalue1234567890")
+    body = json.dumps({"error": {"status": "UNAUTHENTICATED", "message": "API keys are not supported by this API."}}).encode()
+
+    def boom(*a, **k):
+        raise urllib.error.HTTPError("https://x", 401, "Unauthorized", {}, io.BytesIO(body))
+    monkeypatch.setattr(llm_mod, "_post", boom)
+    r = llm_mod.GeminiLLM("gemini-3.5-flash-lite", min_interval_s=0).ask("s", "u", {})
+    assert r.error.startswith("HTTP 401") and "UNAUTHENTICATED" in r.error and "AQ." not in r.error
+    from app.geo.public import classify_ai_error
+    assert classify_ai_error(r.error)[0] == "key_rejected"
+    assert "testkeyvalue" not in Session._short_reason(r.error)
