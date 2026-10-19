@@ -28,7 +28,10 @@ async function api(path, body) {
   let r;
   try { r = await fetch(path, opt); } catch (e) { throw new Error(e.name === 'AbortError' ? 'The server did not answer in time.' : 'Cannot reach the server.'); } finally { clearTimeout(to); }
   let js = null; try { js = await r.json(); } catch (e) { /* not json */ }
-  if (!r.ok) throw new Error(r.status === 403 ? 'Session expired: reload this page.' : ((js && js.error) || ('HTTP ' + r.status)));
+  if (r.status === 403 && js && js.error === 'bad token') {   // the server restarted (a deploy, or waking from sleep): get a fresh page once
+    try { if (Date.now() - (+sessionStorage.getItem('reloaded') || 0) > 30000) { sessionStorage.setItem('reloaded', String(Date.now())); setTimeout(() => location.reload(), 800); } } catch (e) { /* reload by hand */ }
+  }
+  if (!r.ok) throw new Error(r.status === 403 ? 'Session expired: reloading this page…' : ((js && js.error) || ('HTTP ' + r.status)));
   return js;
 }
 
