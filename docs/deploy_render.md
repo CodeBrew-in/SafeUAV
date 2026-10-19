@@ -45,3 +45,16 @@ Not changed: the safety rules (no-fly zone, geofence, battery reserve, pad list)
 connection limits, the simulation-only notices. See [threat_model.md](threat_model.md).
 
 Local mode is unchanged: without `SAFEUAV_PUBLIC=1` the console listens on 127.0.0.1 only.
+
+## If the AI does not answer
+
+The page header chip tells you why, and the chat message says the provider's reason in short form.
+
+| Chip says | Meaning | Fix |
+|---|---|---|
+| AI not configured | no `GEMINI_API_KEY` on Render | add it in *Environment* |
+| AI key rejected | Google says "API key not valid" | create a fresh key at https://aistudio.google.com/apikey and paste it again. New AI Studio keys start with `AQ.` and work. Stray spaces, quotes and line breaks are removed automatically |
+| AI quota used up | the provider's free quota is spent | wait for the daily reset, or use a key from a project with quota |
+| AI limit for today reached | our own daily budget (`SAFEUAV_AI_DAILY_BUDGET`) is spent | raise it in *Environment* |
+
+While any of these is shown, the basic parser keeps answering simple orders.
