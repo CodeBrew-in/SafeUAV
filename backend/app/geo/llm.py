@@ -152,14 +152,22 @@ class LLMReply:
     attempts: list[dict] = field(default_factory=list)
 
 
+def _clean_key(raw: str | None) -> str | None:
+    """A pasted key often carries a space, a line break or quotes. Real keys contain none of them."""
+    if not raw:
+        return None
+    k = "".join(str(raw).split()).strip("\"'")
+    return k or None
+
+
 def gemini_key() -> str | None:
-    key = os.environ.get("GEMINI_API_KEY")
+    key = _clean_key(os.environ.get("GEMINI_API_KEY"))
     if key:
         return key
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
-            return winreg.QueryValueEx(k, "GEMINI_API_KEY")[0]
+            return _clean_key(winreg.QueryValueEx(k, "GEMINI_API_KEY")[0])
     except (OSError, ImportError):
         return None
 

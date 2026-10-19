@@ -191,3 +191,10 @@ def test_gemini_http_errors_carry_googles_reason_without_the_key(monkeypatch):
     from app.geo.public import classify_ai_error
     assert classify_ai_error(r.error)[0] == "key_rejected"
     assert "testkeyvalue" not in Session._short_reason(r.error)
+
+
+@pytest.mark.parametrize("raw", ["AQ.abc123", " AQ.abc123 ", "AQ.abc123\n", '"AQ.abc123"', "AQ.abc\n123", "'AQ.abc123'  "])
+def test_a_pasted_key_with_stray_characters_is_cleaned(monkeypatch, raw):
+    from app.geo.llm import gemini_key
+    monkeypatch.setenv("GEMINI_API_KEY", raw)
+    assert gemini_key() == "AQ.abc123"
