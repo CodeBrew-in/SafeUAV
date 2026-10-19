@@ -382,11 +382,11 @@ def make_llm(model: str):
 
 
 def jobs(missions: dict, models: list[str], sections: list[str]):
-    for sec in ("base", "changes", "attacks"):
-        if sec not in sections:
-            continue
-        for m in missions[sec]:
-            for model in models:
+    for model in models:  # one model at a time, so the local server never reloads mid-run (fair latency)
+        for sec in ("base", "changes", "attacks"):
+            if sec not in sections:
+                continue
+            for m in missions[sec]:
                 if model in ("regex", "gold"):
                     yield sec, model, model, m
                 else:
