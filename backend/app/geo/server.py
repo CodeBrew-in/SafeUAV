@@ -48,15 +48,62 @@ PRESETS = [
 ]
 
 
-class App:
-    """Everything a request handler needs, so tests can build their own."""
+MAX_DRONES = 16
+DRONE_TTL_S = 1800
+DRONE_ID = re.compile(r"[0-9a-f]{32}")
+LOG_TYPES = {"audit.jsonl": "application/x-ndjson", "track.csv": "text/csv; charset=utf-8", "report.html": "text/html; charset=utf-8"}
 
-    def __init__(self, session: Session | None = None):
+
+class App:
+    """Everything a request handler needs, so tests can build their own.
+
+    One drone per browser tab: the page sends its own random id (X-Drone-Id, kept in sessionStorage), and
+    each id gets its own Session. A request without an id uses the default session (tests, curl)."""
+
+    def __init__(self, session: Session | None = None, defaults: dict | None = None):
+        self.defaults = defaults or {}           # from safeuav.toml; applied to every new drone
         self.session = session or Session()
+        self.apply_defaults(self.session)
+        self.drones: dict[str, list] = {}       # id -> [Session, last_seen]
+        self.drone_lock = threading.Lock()
         self.token = secrets.token_urlsafe(24)
         self.port = 0
         self.slots = threading.BoundedSemaphore(MAX_THREADS)
         self._health: tuple[float, dict] | None = None
+
+    def apply_defaults(self, sess: Session) -> None:
+        for k, v in self.defaults.items():
+            sess.set_speed(v) if k == "speed" else sess.configure(**{k: v})
+
+    def session_for(self, drone_id: str | None) -> Session:
+        if not drone_id:
+            return self.session
+        if not DRONE_ID.fullmatch(drone_id):
+            raise SessionError("Bad drone id. Reload the page.")
+        now = time.monotonic()
+        with self.drone_lock:
+            entry = self.drones.get(drone_id)
+            if entry is None:
+                if len(self.drones) >= MAX_DRONES:
+                    idle = min(self.drones.items(), key=lambda kv: kv[1][1])
+                    if now - idle[1][1] < 60:
+                        raise SessionError("All demo drones are busy. Try again in a minute.")
+                    del self.drones[idle[0]]
+                fresh = Session(llm_factory=self.session.llm_factory, campus=self.session.base_campus)
+                self.apply_defaults(fresh)
+                entry = self.drones[drone_id] = [fresh, now]
+            entry[1] = now
+            return entry[0]
+
+    def all_sessions(self) -> list[Session]:
+        with self.drone_lock:
+            return [self.session] + [e[0] for e in self.drones.values()]
+
+    def prune(self) -> None:
+        now = time.monotonic()
+        with self.drone_lock:
+            for k in [k for k, e in self.drones.items() if now - e[1] > DRONE_TTL_S]:
+                del self.drones[k]
 
     def hosts(self) -> set[str]:
         return {f"127.0.0.1:{self.port}", f"localhost:{self.port}"}
@@ -174,6 +221,16 @@ def make_handler(app: App):
                 return self._json(build_basemap())
             if path == "/api/health":
                 return self._json(app.health())
+            s = app.session_for(self.headers.get("X-Drone-Id"))
+            if path.startswith("/api/logs/"):
+                kind = path[len("/api/logs/"):]
+                if kind not in LOG_TYPES:
+                    return self._deny(404, "not found")
+                from . import exports
+                d = s.export_data()
+                body = {"audit.jsonl": exports.audit_jsonl, "track.csv": exports.track_csv, "report.html": exports.report_html}[kind](d)
+                return self._send(200, body.encode("utf-8"), LOG_TYPES[kind],
+                                  {"Content-Disposition": f'attachment; filename="safeuav-{kind}"'})
             if path == "/api/state":
                 q = parse_qs(url.query, keep_blank_values=True)
                 since = {}
@@ -183,7 +240,7 @@ def make_handler(app: App):
                     except ValueError:
                         return self._deny(400, f"bad {k}")
                 since["zones_sig"] = q.get("zones_sig", [None])[0]
-                return self._json(app.session.snapshot(since))
+                return self._json(s.snapshot(since))
             self._deny(404, "not found")
 
         # --- POST -------------------------------------------------------------------------------
@@ -224,15 +281,17 @@ def make_handler(app: App):
             body = self._body()
             if body is None:
                 return
-            s, path = app.session, self.path.split("?")[0]
+            s, path = app.session_for(self.headers.get("X-Drone-Id")), self.path.split("?")[0]
             if path == "/api/chat":
                 from .operator import strict_keyword
                 from .session import END_WORDS
-                said = str(body.get("text", "")).strip()
+                if not isinstance(body.get("text", ""), str):
+                    return self._deny(400, "text must be a string")
+                said = body.get("text", "").strip()
                 safety = len(said) <= 60 and (strict_keyword(said) or END_WORDS.match(said))
                 if s.token and not safety:
                     return self._deny(409, "still working on the previous message")
-                text = str(body.get("text", ""))
+                text = body.get("text", "")
 
                 def work():
                     try:
@@ -244,6 +303,9 @@ def make_handler(app: App):
                         s.say("system", "Internal error while reading the message. Mission unchanged.", level="bad")
                 threading.Thread(target=work, daemon=True).start()
                 return self._json({"ok": True})
+            if path == "/api/circle":
+                name = s.add_circle(body.get("x"), body.get("y"), body.get("r"))
+                return self._json({"ok": True, "name": name})
             if path == "/api/edit":
                 op = body.get("op")
                 if not isinstance(op, str):
@@ -268,7 +330,10 @@ def make_handler(app: App):
                 kind = body.get("kind")
                 if kind not in ("return", "land"):
                     return self._deny(400, "bad kind")
-                s.emergency(kind)
+                pad = body.get("pad")
+                if pad is not None and not isinstance(pad, str):
+                    return self._deny(400, "bad pad")
+                s.emergency(kind, pad)
                 return self._json({"ok": True})
             self._deny(404, "not found")
 
@@ -311,24 +376,38 @@ def make_server(app: App, port: int = 0) -> ThreadingHTTPServer:
 
 def sim_loop(app: App, stop: threading.Event) -> None:
     """One simulated second per tick; `speed` only changes how long we wait between ticks."""
-    last = None
+    last: dict[int, str | None] = {}
+    prev, pruned = time.monotonic(), time.monotonic()
     while not stop.is_set():
-        time.sleep(1.0 / app.session.speed)
-        try:
-            app.session.tick()
-            last = None
-        except Exception as e:  # keep the console alive, and say so on screen (once per kind of error)
-            log.exception("simulation tick failed")
-            if type(e).__name__ != last:
-                app.session.say("system", f"Internal simulator error: {type(e).__name__}. Press Reset.", level="bad")
-            last = type(e).__name__
-            time.sleep(1)
+        time.sleep(0.1)
+        now = time.monotonic()
+        dt, prev = min(now - prev, 1.0), now
+        if now - pruned > 60:
+            app.prune()
+            pruned = now
+        for sess in app.all_sessions():
+            try:
+                sess.advance(dt)
+                last[id(sess)] = None
+            except Exception as e:  # keep the console alive, and say so on screen (once per kind of error)
+                log.exception("simulation tick failed")
+                if last.get(id(sess)) != type(e).__name__:
+                    sess.say("system", f"Internal simulator error: {type(e).__name__}. Press Reset.", level="bad")
+                last[id(sess)] = type(e).__name__
 
 
-def main(port: int = 8000) -> None:
+def main(port: int | None = None) -> None:
+    import sys
+    from .settings import SettingsError, load
+    if sys.version_info < (3, 11):
+        raise SystemExit("SafeUAV needs Python 3.11 or newer.")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    app = App()
-    srv = make_server(app, port)
+    try:
+        cfg = load()
+        app = App(defaults=cfg["session"])
+    except (SettingsError, SessionError) as e:
+        raise SystemExit(f"Settings problem: {e}")
+    srv = make_server(app, port or cfg["port"])
     stop = threading.Event()
     threading.Thread(target=sim_loop, args=(app, stop), daemon=True).start()
     h = app.health()
@@ -345,4 +424,4 @@ def main(port: int = 8000) -> None:
 
 if __name__ == "__main__":
     import sys
-    main(int(sys.argv[1]) if len(sys.argv) > 1 else 8000)
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else None)

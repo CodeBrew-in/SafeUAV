@@ -1,0 +1,6 @@
+-r requirements.txt
+pytest==9.1.1
+hypothesis==6.170.1
+# only for plots in the Phase 2 analysis scripts
+matplotlib==3.11.2
+numpy==2.5.4

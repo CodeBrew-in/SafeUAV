@@ -493,3 +493,135 @@ def test_a_chat_reply_keeps_restrictions_when_no_target_is_set():
     s.edit("avoid_add", DIR)
     s.handle("inspect the library")
     assert s.desired.targets == (LIB,) and [r.zone for r in s.desired.avoid] == [DIR]
+
+
+# --- final review: land at a chosen pad, end-on-ground race, zones after DONE ---------------------------
+
+def _fly(s, n=15):
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, n)
+
+
+def _pads_by_distance(s):
+    from math import hypot
+    return sorted(s.campus.pads, key=lambda n: hypot(s.campus.pads[n][0] - s.ctl.pos[0], s.campus.pads[n][1] - s.ctl.pos[1]))
+
+
+def test_land_at_a_chosen_pad_goes_there_not_to_the_nearest():
+    s = sess()
+    _fly(s)
+    pad = _pads_by_distance(s)[-2]                       # not the nearest one
+    s.emergency("land", pad)
+    run_ticks(s, 900)
+    assert s.phase == "WAITING"
+    px, py = s.campus.pads[pad]
+    assert abs(s.ctl.pos[0] - px) < 3 and abs(s.ctl.pos[1] - py) < 3
+
+
+def test_land_at_a_pad_that_fails_the_shield_is_refused_and_the_drone_flies_on():
+    s = sess()
+    _fly(s)
+    s.ctl.energy = 2.0                                    # barely above the reserve: a far pad is too far
+    far = _pads_by_distance(s)[-1]
+    state, ver = s.ctl.state, s.ctl.version
+    with pytest.raises(SessionError, match="Can't land at"):
+        s.emergency("land", far)
+    assert not s.safety_pending and s.ctl.state == state and s.ctl.version == ver
+    s.ctl.energy = 30.0
+    blocked = _pads_by_distance(s)[1]
+    s.edit("avoid_add", blocked)
+    run_ticks(s, 2)                                       # the restriction reaches the controller
+    with pytest.raises(SessionError, match="inside"):
+        s.emergency("land", blocked)
+    with pytest.raises(SessionError, match="not a landing pad"):
+        s.emergency("land", LIB)
+    with pytest.raises(SessionError):
+        s.emergency("return", "Fete Area")
+
+
+def test_chat_land_at_a_pad_is_handled_without_the_ai():
+    class Boom:
+        def ask(self, *a, **k):
+            raise AssertionError("AI must not be called")
+    s = sess(Boom())
+    _fly(s)
+    pad = _pads_by_distance(s)[-2]
+    s.handle(f"land at {pad}")
+    run_ticks(s, 900)
+    assert s.phase == "WAITING" and any(c.get("status") == "keyword" for c in s.chat)
+
+
+def test_end_mission_on_the_ground_drops_a_late_ai_reply():
+    gate = threading.Event()
+    llm = FakeLLM(reply([DIR]), wait=gate)
+    s = sess(llm)
+    _fly(s)
+    s.emergency("land")
+    run_ticks(s, 900)
+    assert s.phase == "WAITING"
+    t = _chat_in_thread(s, "now inspect the directorate")
+    assert llm.started.wait(3)
+    s.end_mission()
+    gate.set()
+    t.join(5)
+    run_ticks(s, 50)
+    assert s.phase == "DONE" and s.ctl.state == "DONE"      # the late reply did not start a new leg
+
+
+def test_zones_are_drawn_after_the_mission_is_done_and_holding_stops_during_a_landing():
+    s = sess()
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 600)
+    assert s.phase == "DONE"
+    s.edit("avoid_add", "E Hostel")
+    assert "E Hostel" in [z["name"] for z in s.snapshot()["zones"]]
+    s2 = sess(FakeLLM(reply([LIB]), wait=threading.Event()))
+    _fly(s2, 10)
+    th = _chat_in_thread(s2, "inspect the library")
+    assert s2.llm_factory("x").started.wait(3)
+    assert s2.holding
+    s2.emergency("land")
+    assert not s2.holding
+    s2.llm_factory("x").wait.set()
+    th.join(5)
+
+
+def test_a_restricted_drawn_area_is_flown_around_and_the_cap_holds():
+    s = sess()
+    (bx, by), (lx, ly) = s.campus.pads["Football Ground"], s.campus.find(LIB).center
+    mx, my = (bx + lx) / 2, (by + ly) / 2
+    name = s.add_circle(mx, my, 60)
+    s.edit("avoid_add", name)
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 900)
+    assert s.phase == "DONE"
+    assert all(((x - mx) ** 2 + (y - my) ** 2) ** 0.5 > 60 for _, x, y, _ in s.ctl.track)   # never inside the area
+    for _ in range(7):
+        s.add_circle(bx, by + 200, 30)
+    with pytest.raises(SessionError, match="At most"):
+        s.add_circle(bx, by + 200, 30)
+
+
+def test_a_drawn_area_survives_reset_and_a_settings_change_but_stays_per_session():
+    s, other = sess(), sess()
+    bx, by = s.campus.pads["Football Ground"]
+    name = s.add_circle(bx + 100, by + 100, 40)
+    s.configure(capacity=30)
+    assert s.campus.find(name) is not None and other.campus.find(name) is None
+    s.reset()
+    assert s.campus.find(name) is not None
+
+
+def test_advance_turns_real_time_into_ticks_at_the_session_speed():
+    s = sess()
+    s.edit("target_add", LIB)
+    s.start()
+    t0 = s.ctl.t
+    s.advance(1.0)                    # default speed 2x: 2 ticks per real second
+    assert s.ctl.t == t0 + 2
+    s.set_speed(5)
+    s.advance(1.0)
+    assert s.ctl.t == t0 + 7

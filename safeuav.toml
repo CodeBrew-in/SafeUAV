@@ -1,0 +1,16 @@
+# SafeUAV console settings. Every line is optional; the values shown are the defaults.
+# The safety rules (no-fly zone, geofence, battery reserve, landing pads) are NOT settings.
+
+[server]
+# port = 8000
+
+[session]
+# model = "gemini-3.5-flash-lite"     # or "qwen2.5:7b", "qwen2.5:3b"
+# mode = "ours"                       # "ours" (AI -> shield), "classic" (no AI), "direct" (AI, no shield)
+# capacity = 40                       # battery, Wh
+# wind_speed = 3                      # real wind, m/s
+# wind_from = 270                     # degrees
+# clock = "10:00"
+# monitor = true                      # runtime battery monitor
+# wait_for_ai = true                  # hold the drone while the AI reads a message
+# speed = 2                           # 1, 2 or 5

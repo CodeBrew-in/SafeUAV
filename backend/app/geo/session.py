@@ -22,7 +22,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from .campus import Campus, load_campus, norm
+from .campus import Campus, Place, load_campus, norm
 from .controller import FLYING, Command, Controller
 from .flight import AVOID_BUFFER, HOVER_W, Airspace, Wind, horizon_min
 from .llm import GeminiLLM, OllamaLLM
@@ -34,7 +34,10 @@ DEFAULT_SPEED = 2
 MODELS = ["gemini-3.5-flash-lite", "qwen2.5:7b", "qwen2.5:3b"]
 MODES = ("ours", "classic", "direct")
 MAX_AVOID = 20
+MAX_CIRCLES = 8
+CIRCLE_R = (20.0, 300.0)
 END_WORDS = re.compile(r"^\s*(please\s+)?(end|finish|stop|cancel)\s+(the\s+|this\s+)?(mission|flight)\W*$", re.I)
+LAND_AT = re.compile(r"^\s*(?:please\s+)?land\s+(?:at|on)\s+(?:the\s+)?(.+?)\W*$", re.I)
 ONLY_WORDS = re.compile(r"\b(only|instead)\b", re.I)
 HOLD_MAX_TICKS = 20      # the drone waits for the AI at most this many simulated seconds
 MAX_CHAT = 400
@@ -132,6 +135,9 @@ class Session:
         self.safety_pending = False    # Land/Return/End is under way: orders wait until the drone is down
         self.hold_ticks = 0
         self.chat_dropped = 0
+        self._acc = 0.0                # real seconds * speed not yet turned into simulation ticks
+        self.circles: list[dict] = []  # areas the operator drew: name, x, y, r
+        self.circle_n = 0
         self._audit_seen = 0
         self._rebuild()
 
@@ -143,11 +149,58 @@ class Session:
     def _rebuild(self) -> None:
         cfg = self.cfg
         pad = self.base_campus.pads[cfg.base_pad]
-        self.campus = dataclasses.replace(self.base_campus, base=pad)
+        # own copy of the places, so a drawn area never leaks into the shared campus
+        self.campus = dataclasses.replace(self.base_campus, base=pad, places=dict(self.base_campus.places))
+        self._install_circles()
         self.ctl = Controller(self.campus, capacity_wh=cfg.capacity, forecast=FORECAST,
                               actual=Wind(cfg.wind_speed, cfg.wind_from),
                               clock_min=parse_time(cfg.clock), monitor=cfg.monitor)
         self._audit_seen = len(self.ctl.audit)
+
+    # --- areas the operator draws ---------------------------------------------------------------
+    @staticmethod
+    def _circle_poly(c: dict) -> tuple:
+        return tuple((c["x"] + c["r"] * math.cos(2 * math.pi * i / 24), c["y"] + c["r"] * math.sin(2 * math.pi * i / 24))
+                     for i in range(24))
+
+    def _install_circles(self) -> None:
+        for c in self.circles:
+            self.campus.places[norm(c["name"])] = Place(c["name"], "area", self._circle_poly(c), (c["x"], c["y"]))
+
+    def add_circle(self, x, y, r) -> str:
+        """A round area the operator drew. It is a normal place afterwards: it can be restricted or made a
+        target, and every such change still goes through the shield."""
+        with self.lock:
+            for v in (x, y, r):
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                    raise SessionError("The area needs numbers for its centre and radius.")
+            if not CIRCLE_R[0] <= r <= CIRCLE_R[1]:
+                raise SessionError(f"The radius must be between {CIRCLE_R[0]:.0f} and {CIRCLE_R[1]:.0f} m.")
+            if not self.campus.in_fence((x, y)):
+                raise SessionError("The centre is outside the flight area.")
+            if len(self.circles) >= MAX_CIRCLES:
+                raise SessionError(f"At most {MAX_CIRCLES} drawn areas. Delete one first.")
+            self.circle_n += 1
+            name = f"Area {self.circle_n}"
+            if self.campus.find(name) is not None:
+                raise SessionError("That name is taken.")
+            self.circles.append({"name": name, "x": round(float(x), 1), "y": round(float(y), 1), "r": round(float(r), 1)})
+            self._install_circles()
+            return name
+
+    def remove_circle(self, name) -> str:
+        with self.lock:
+            c = next((c for c in self.circles if _k(c["name"]) == _k(str(name))), None)
+            if c is None:
+                raise SessionError("That is not a drawn area.")
+            used = [t for t in self.desired.targets] + [a.zone for a in self.desired.avoid]
+            if self.started and self.ctl.spec:
+                used += list(self.ctl.spec.targets) + [a.zone for a in self.ctl.spec.avoid]
+            if any(_k(u) == _k(c["name"]) for u in used):
+                raise SessionError(f"{c['name']} is still part of the mission. Remove it from the mission first.")
+            self.circles.remove(c)
+            self.campus.places.pop(norm(c["name"]), None)
+            return f"Deleted {c['name']}."
 
     # --- state ----------------------------------------------------------------------------------
     @property
@@ -168,7 +221,8 @@ class Session:
     @property
     def holding(self) -> bool:
         """The drone waits (hovers) while the AI reads a message."""
-        return bool(self.token) and self.started and self.cfg.wait_for_ai and self.cfg.mode != "direct"
+        return (bool(self.token) and self.started and self.cfg.wait_for_ai and self.cfg.mode != "direct"
+                and not self.safety_pending)
 
     def say(self, who: str, text: str, **extra) -> None:
         with self.lock:
@@ -252,6 +306,8 @@ class Session:
         """Click edits. Returns a short confirmation for the operator."""
         with self.lock:
             self._editable()
+            if op == "circle_remove":
+                return self.remove_circle(place)
             cur = self.working_spec()
             if op == "clear":
                 if self.started:
@@ -384,8 +440,14 @@ class Session:
             self.chat, self.direct = [], None
             self._rebuild()
 
-    def emergency(self, kind: str) -> None:
-        """'return' or 'land': works without the AI, only while flying."""
+    def _zone_spec(self) -> MissionSpec:
+        """The rules the map should show: the flight's own, or the operator's after the mission is done."""
+        if self.started and self.ctl.spec and self.ctl.state != "DONE":
+            return self.ctl.spec
+        return self.desired
+
+    def emergency(self, kind: str, pad: str | None = None) -> None:
+        """'return' or 'land' (optionally at a chosen pad): works without the AI, only while flying."""
         with self.lock:
             if kind not in ("return", "land"):
                 raise SessionError("Unknown command.")
@@ -393,12 +455,20 @@ class Session:
                 raise SessionError("The drone is already on the ground.")
             if self.phase not in ("FLYING", "PAUSED"):
                 raise SessionError("Nothing is flying.")
+            if pad is not None:
+                if kind != "land":
+                    raise SessionError("Only a landing can name a pad.")
+                if pad not in self.campus.pads:
+                    raise SessionError("That is not a landing pad.")
+                plan, reason = self.ctl.land_plan(pad)
+                if plan is None:                  # refused here, so nothing changes and the drone flies on
+                    raise SessionError(f"Can't land at {pad}: {reason}.")
             self.paused = False
             self.resume_submit = False
             self.end_after_land = False
             self.safety_pending = True
             self.gen += 1                    # answers to messages sent before this command are dropped
-            self.ctl.submit(Command(kind, None, f"operator: {kind} now"))
+            self.ctl.submit(Command(kind, None, f"operator: {kind} now" + (f" at {pad}" if pad else ""), pad))
 
     def end_mission(self) -> None:
         """The operator ends the mission: land on the nearest pad if airborne, then finish (DONE).
@@ -417,11 +487,21 @@ class Session:
             elif st == "LANDED_WAIT":
                 self.paused = False
                 self.resume_submit = False
+                self.gen += 1                # an AI reply still on its way must not start a new leg
                 self.ctl._set_state("DONE", "mission ended by the operator")
             elif st == "DONE":
                 raise SessionError("The mission is already complete.")
             else:
                 raise SessionError("This flight has ended. Press Reset to start another.")
+
+    def advance(self, real_dt: float) -> None:
+        """Called by the server loop: turns real time into simulation ticks at this session's speed."""
+        with self.lock:
+            self._acc = min(self._acc + real_dt * self.speed, 12.0)
+            n = int(self._acc)
+            self._acc -= n
+        for _ in range(n):
+            self.tick()
 
     # --- simulation tick ------------------------------------------------------------------------
     def tick(self) -> None:
@@ -466,6 +546,22 @@ class Session:
                 except SessionError as e:
                     self.say("system", f"Not applied: {e}", level="bad")
             return
+        m = LAND_AT.match(text) if len(text) <= 60 else None
+        if m:
+            pads = {_k(n): n for n in self.campus.pads}
+            pad = pads.get(_k(m.group(1)))
+            if pad is not None:
+                with self.lock:
+                    self.say("operator", text)
+                    try:
+                        if not self.started:
+                            self.say("ai", "Nothing is flying yet.", status="keyword")
+                        else:
+                            self.emergency("land", pad)
+                            self.say("ai", f"Landing at {pad} (handled without the AI)", status="keyword")
+                    except SessionError as e:
+                        self.say("system", f"Not applied: {e}", level="bad")
+                return
         kind = strict_keyword(text)
         if kind is not None:
             with self.lock:
@@ -578,10 +674,27 @@ class Session:
 
     # --- what the browser sees ------------------------------------------------------------------
     def zones_signature(self) -> str:
-        spec = self.ctl.spec if self.started and self.ctl.spec else self.desired
+        spec = self._zone_spec()
         air = Airspace.for_spec(self.campus, spec, self.ctl.clock(),
                                 self.ctl.clock() + horizon_min(self.cfg.capacity))
         return ",".join(sorted(n for n, _, _ in air.avoid_polys))
+
+    def export_data(self) -> dict:
+        """Plain data for the downloads (see exports.py)."""
+        from . import exports
+        from .version import VERSION
+        with self.lock:
+            ctl, snap = self.ctl, self.snapshot()
+            return {
+                "version": VERSION, "exported_utc": exports.stamp(), "phase": self.phase,
+                "config": dataclasses.asdict(self.cfg), "mission": self.desired.to_json(),
+                "audit": [dict(a) for a in ctl.audit], "chat": [dict(c) for c in self.chat],
+                "track": [(t, x, y, st) for t, x, y, st in ctl.track], "fence": self.campus.fence,
+                "no_fly": [{"name": n, "poly": list(poly)} for n, (poly, _) in self.campus.permanent_no_fly.items()],
+                "zones": snap["zones"], "pads": dict(self.campus.pads), "targets": snap["targets"],
+                "t": ctl.t, "battery_wh": snap["battery_wh"], "battery_pct": snap["battery_pct"],
+                "visited": snap["visited_names"],
+            }
 
     def snapshot(self, since: dict | None = None) -> dict:
         """Delta feed: only what changed since the client's offsets (epoch mismatch = send everything)."""
@@ -606,6 +719,8 @@ class Session:
                 "audit": ctl.audit[g("audit"):], "audit_total": len(ctl.audit),
                 "track": [[round(x, 1), round(y, 1), s] for _, x, y, s in ctl.track[g("track"):]],
                 "track_total": len(ctl.track), "direct": self.direct,
+                "circles": [{"name": c["name"], "center": [c["x"], c["y"]], "r": c["r"],
+                             "poly": [[round(x, 1), round(y, 1)] for x, y in self._circle_poly(c)]} for c in self.circles],
             }
             if fresh or since.get("route_rev") != snap["version"]:
                 out["route"] = snap["route"]
@@ -613,7 +728,7 @@ class Session:
             sig = self.zones_signature()
             out["zones_sig"] = sig
             if fresh or since.get("zones_sig") != sig:
-                spec = ctl.spec if self.started and ctl.spec else self.desired
+                spec = self._zone_spec()
                 air = Airspace.for_spec(self.campus, spec, ctl.clock(), ctl.clock() + horizon_min(self.cfg.capacity))
                 out["zones"] = [{"name": n, "poly": [[round(x, 1), round(y, 1)] for x, y in poly], "buffer": b}
                                 for n, poly, b in air.avoid_polys]

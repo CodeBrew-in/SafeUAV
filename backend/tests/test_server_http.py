@@ -37,13 +37,15 @@ def call(app, method, path, body=None, **kw):
 
 
 def _call(app, method, path, body=None, *, token=True, host=None, origin=None, ctype="application/json",
-          clen=None, raw=None):
+          clen=None, raw=None, drone=None):
     c = http.client.HTTPConnection("127.0.0.1", app.port, timeout=5)
     h = {"Host": host or f"127.0.0.1:{app.port}"}
     if token:
         h["X-Session-Token"] = app.token if token is True else token
     if origin:
         h["Origin"] = origin
+    if drone:
+        h["X-Drone-Id"] = drone
     data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
     if method == "POST":
         if ctype:
@@ -182,3 +184,87 @@ def test_review_hardening_headers_nan_deep_json_and_strict_values(srv):
     assert call(srv, "POST", "/api/reset", raw=b"{}", clen="+5")[0] == 400
     assert call(srv, "POST", "/api/reset", raw=b"{}", clen="1_0")[0] == 400
     assert call(srv, "POST", "/api/config", {"model": "gpt"})[1]["error"].startswith("Model must be one of")
+
+
+A, B = "a" * 32, "b" * 32
+
+
+def test_each_browser_tab_has_its_own_drone(srv):
+    for d in (None, A, B):
+        call(srv, "POST", "/api/reset", {}, drone=d)
+        call(srv, "POST", "/api/edit", {"op": "clear"}, drone=d)
+    assert call(srv, "POST", "/api/edit", {"op": "target_add", "place": "Nava Nalanda Library"}, drone=A)[0] == 200
+    assert call(srv, "GET", "/api/state", drone=A)[1]["desired"]["targets"] == ["Nava Nalanda Library"]
+    assert call(srv, "GET", "/api/state", drone=B)[1]["desired"]["targets"] == []
+    assert call(srv, "GET", "/api/state")[1]["desired"]["targets"] == []
+    assert call(srv, "POST", "/api/start", {}, drone=A)[0] == 200
+    assert call(srv, "GET", "/api/state", drone=B)[1]["phase"] == "DRAFT"      # B is not flying
+    assert call(srv, "POST", "/api/pause", {}, drone=B)[0] == 400
+    assert call(srv, "POST", "/api/reset", {}, drone=A)[0] == 200
+    for bad in ("short", "G" * 32, "a" * 33):
+        assert call(srv, "GET", "/api/state", drone=bad)[0] == 400
+
+
+def test_the_downloads_are_valid_and_inert(srv):
+    call(srv, "POST", "/api/reset", {}, drone=A)
+    call(srv, "POST", "/api/edit", {"op": "target_add", "place": "Nava Nalanda Library"}, drone=A)
+    call(srv, "POST", "/api/start", {}, drone=A)
+    s = srv.session_for(A)
+    s.say("operator", "<script>alert(1)</script> =HYPERLINK(1)")
+    for _ in range(30):
+        s.tick()
+    st, _, raw, hdr = call(srv, "GET", "/api/logs/audit.jsonl", drone=A)
+    lines = [json.loads(x) for x in raw.decode().splitlines()]
+    assert st == 200 and lines[0]["type"] == "meta" and any(x["type"] == "audit" for x in lines) and any(x["type"] == "chat" for x in lines)
+    assert hdr["Content-Disposition"].startswith("attachment")
+    st, _, raw, _ = call(srv, "GET", "/api/logs/track.csv", drone=A)
+    rows = raw.decode().splitlines()
+    assert rows[0] == "t_s,x_m,y_m,state" and len(rows) > 20
+    st, _, raw, hdr = call(srv, "GET", "/api/logs/report.html", drone=A)
+    page = raw.decode()
+    assert "SIMULATION ONLY" in page and "<script>alert" not in page and "&lt;script&gt;" in page and "OpenStreetMap" in page
+    assert call(srv, "GET", "/api/logs/secret.txt", drone=A)[0] == 404
+    assert call(srv, "GET", "/api/logs/audit.jsonl", token=False)[0] == 403
+    assert srv.token.encode() not in raw
+    call(srv, "POST", "/api/reset", {}, drone=A)
+
+
+def test_csv_cells_cannot_become_formulas():
+    from app.geo.exports import _cell
+    assert _cell("=1+1").startswith("'") and _cell("CRUISE") == "CRUISE" and _cell("-5") == "-5"
+
+
+def test_drawn_areas_over_http(srv):
+    call(srv, "POST", "/api/reset", {}, drone=B)
+    cx, cy = srv.session.campus.pads["Football Ground"]
+    st, js, _, _ = call(srv, "POST", "/api/circle", {"x": cx + 60, "y": cy + 60, "r": 50}, drone=B)
+    assert st == 200 and js["name"] == "Area 1"
+    snap = call(srv, "GET", "/api/state", drone=B)[1]
+    assert [c["name"] for c in snap["circles"]] == ["Area 1"]
+    assert call(srv, "GET", "/api/state", drone=A)[1]["circles"] == []                  # another tab does not see it
+    assert "area 1" not in srv.session.base_campus.places                               # the shared campus is untouched
+    for bad in ({"x": cx, "y": cy, "r": 5}, {"x": cx, "y": cy, "r": 900}, {"x": 1e9, "y": 0, "r": 50}, {"x": "a", "y": 0, "r": 50}):
+        assert call(srv, "POST", "/api/circle", bad, drone=B)[0] == 400
+    assert call(srv, "POST", "/api/edit", {"op": "avoid_add", "place": "Area 1"}, drone=B)[0] == 200
+    assert call(srv, "POST", "/api/edit", {"op": "circle_remove", "place": "Area 1"}, drone=B)[0] == 400   # still in the mission
+    assert call(srv, "POST", "/api/edit", {"op": "avoid_remove", "place": "Area 1"}, drone=B)[0] == 200
+    assert call(srv, "POST", "/api/edit", {"op": "circle_remove", "place": "Area 1"}, drone=B)[0] == 200
+    call(srv, "POST", "/api/reset", {}, drone=B)
+
+
+def test_settings_file_is_validated_and_cannot_touch_safety_constants(tmp_path):
+    from app.geo.server import App
+    from app.geo.settings import SettingsError, load
+    good = tmp_path / "ok.toml"
+    good.write_text('[server]\nport = 8123\n[session]\nmodel = "qwen2.5:3b"\ncapacity = 30\nspeed = 5\n', encoding="utf-8")
+    cfg = load(good)
+    assert cfg == {"port": 8123, "session": {"model": "qwen2.5:3b", "capacity": 30, "speed": 5}}
+    app = App(Session(llm_factory=lambda m: FakeLLM()), defaults=cfg["session"])
+    assert app.session.cfg.capacity == 30 and app.session.speed == 5
+    assert app.session_for("c" * 32).cfg.model == "qwen2.5:3b"            # new drones get the defaults too
+    for bad in ('[session]\nreserve = 0\n', '[session]\nfloor_fraction = 0\n', '[session]\nmonitor = "no"\n',
+                '[server]\nport = 80\n', '[x]\na = 1\n', '[session]\ncapacity = true\n', 'not toml ['):
+        f = tmp_path / "bad.toml"
+        f.write_text(bad, encoding="utf-8")
+        with pytest.raises(SettingsError):
+            load(f)

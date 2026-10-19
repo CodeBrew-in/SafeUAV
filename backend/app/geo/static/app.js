@@ -16,8 +16,13 @@ function h(tag, attrs, ...kids) {
   return e;
 }
 
+// one drone per browser tab: this id lives in sessionStorage, so a new tab gets its own drone
+function rand32() { return Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join(''); }
+let DRONE = '';
+try { DRONE = sessionStorage.getItem('drone') || ''; if (!/^[0-9a-f]{32}$/.test(DRONE)) { DRONE = rand32(); sessionStorage.setItem('drone', DRONE); } } catch (e) { DRONE = DRONE || rand32(); }
+
 async function api(path, body) {
-  const opt = { headers: { 'X-Session-Token': TOKEN } };
+  const opt = { headers: { 'X-Session-Token': TOKEN, 'X-Drone-Id': DRONE } };
   if (body !== undefined) { opt.method = 'POST'; opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
   const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 8000); opt.signal = ctl.signal;
   let r;
@@ -30,7 +35,7 @@ async function api(path, body) {
 // ---------------------------------------------------------------- state
 let MAP = null, S = null;
 let chat = [], audit = [], trail = [], route = [], zones = [];
-let ghost = null, rejects = 0, violations = 0, firstPoll = true;
+let drawMode = false, circlePrev = null, circleSig = '', ghost = null, rejects = 0, violations = 0, firstPoll = true;
 let since = { epoch: -1, chat: 0, audit: 0, track: 0, route_rev: -1, zones_sig: null };
 let lastOk = 0, busySince = 0, initialChat = true, logShown = -1;
 let userMoved = false, view = { cx: 0, cy: 0, scale: 1 }, follow = false, dirtyBase = true, hover = null, selected = null;
@@ -103,9 +108,13 @@ new ResizeObserver(resize).observe(cv);
 
 // input: drag to pan, wheel to zoom, click to select
 let drag = null;
-cv.addEventListener('pointerdown', e => { if (e.button !== 0) return; cv.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy, moved: false }; });
+cv.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return; cv.setPointerCapture(e.pointerId);
+  if (drawMode) { const r = cv.getBoundingClientRect(); circlePrev = { c: toWorld(e.clientX - r.left, e.clientY - r.top), r: 0 }; return; }
+  drag = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy, moved: false }; });
 cv.addEventListener('pointermove', e => {
   const r = cv.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+  if (circlePrev) { const w = toWorld(px, py); circlePrev.r = Math.hypot(w[0] - circlePrev.c[0], w[1] - circlePrev.c[1]); return; }
   if (drag) {
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
     if (!drag.moved && Math.hypot(dx, dy) > 4) { drag.moved = true; userMoved = true; cv.classList.add('dragging'); setFollow(false); hideCard(); }
@@ -115,10 +124,19 @@ cv.addEventListener('pointermove', e => {
     if (hv !== hover) { hover = hv; dirtyBase = true; cv.title = hv ? hv.name : ''; }
   }
 });
-const endDrag = () => { drag = null; cv.classList.remove('dragging'); };
+const endDrag = () => { drag = null; circlePrev = null; cv.classList.remove('dragging'); };
 cv.addEventListener('pointercancel', endDrag);
 cv.addEventListener('lostpointercapture', endDrag);
-cv.addEventListener('pointerup', e => {
+cv.addEventListener('pointerup', async e => {
+  if (circlePrev) {
+    const c = circlePrev; circlePrev = null; setDraw(false);
+    if (c.r < 20) return toast('AREA', 'Drag further out: the radius must be 20 to 300 m.', 'warn');
+    try {
+      const res = await api('/api/circle', { x: c.c[0], y: c.c[1], r: Math.min(300, c.r) }); await poll();
+      const pl = placeByName[res.name]; if (pl) { const q = P(pl.center[0], pl.center[1]); onMapClick(q[0], q[1], pl); }
+    } catch (err) { showReject(err.message); }
+    return;
+  }
   if (e.button !== 0) return endDrag();
   cv.classList.remove('dragging');
   const wasClick = drag && !drag.moved; drag = null;
@@ -130,9 +148,11 @@ $('zin').onclick = () => zoomAt(W / 2, H / 2, 1.4);
 $('zout').onclick = () => zoomAt(W / 2, H / 2, 1 / 1.4);
 $('fit').onclick = () => { setFollow(false); userMoved = false; fitView(); };
 $('follow').onclick = () => setFollow(!follow);
+function setDraw(v) { drawMode = v; circlePrev = null; $('draw').setAttribute('aria-pressed', String(v)); cv.style.cursor = v ? 'crosshair' : ''; if (v) toast('DRAW AN AREA', 'Press on the map and drag outward to set the radius (20 to 300 m).'); }
+$('draw').onclick = () => setDraw(!drawMode);
 function setFollow(v) { follow = v; $('follow').setAttribute('aria-pressed', String(v)); }
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') hideCard();
+  if (e.key === 'Escape') { hideCard(); const d = $('dlg'); if (!d.classList.contains('hidden')) d.querySelectorAll('button')[1].click(); }
   const a = document.activeElement;
   if (e.key === ' ' && S && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && (a === document.body || a === cv)) { e.preventDefault(); $('pause').click(); }
 });
@@ -154,6 +174,20 @@ function loadMap(m, basemap) {
   hatchNoFly = hatchPattern('#d92d20'); hatchAvoid = hatchPattern('#ee7a00');
   $('ver').textContent = 'v' + m.version;
   resize(); fitView();
+}
+function syncCircles(list) {
+  const sig = JSON.stringify(list || []);
+  if (sig === circleSig) return; circleSig = sig;
+  places = places.filter(p => p.kind !== 'area');
+  for (const c of list || []) places.push({ name: c.name, kind: 'area', poly: c.poly, center: c.center, area: Math.PI * c.r * c.r, region: false });
+  placeByName = Object.fromEntries(places.map(p => [p.name, p])); dirtyBase = true;
+}
+function drawCircles() {
+  ctx.save(); ctx.lineWidth = 2; ctx.setLineDash([7, 5]);
+  const ring = (c, r, col) => { const q = P(c[0], c[1]); ctx.beginPath(); ctx.arc(q[0], q[1], r * view.scale, 0, 7); ctx.fillStyle = col + '1c'; ctx.fill(); ctx.strokeStyle = col; ctx.stroke(); };
+  for (const c of (S.circles || [])) ring(c.center, c.r, '#6b7280');
+  if (circlePrev && circlePrev.r > 0) { ring(circlePrev.c, Math.min(300, circlePrev.r), '#ee7a00'); const q = P(circlePrev.c[0], circlePrev.c[1]); ctx.setLineDash([]); ctx.fillStyle = '#14213d'; ctx.font = '700 13px system-ui'; ctx.textAlign = 'center'; ctx.fillText(Math.round(Math.min(300, circlePrev.r)) + ' m', q[0], q[1]); }
+  ctx.restore();
 }
 function placeAt(w) {
   for (const z of MAP.no_fly) if (pip(w, z.poly)) return { name: z.name, kind: 'no-fly', nofly: true };
@@ -306,6 +340,7 @@ function render(now) {
   if (baseCanvas) ctx.drawImage(baseCanvas, 0, 0, W, H);
   if (S) {
     const live = S.config.mode !== 'direct';
+    drawCircles();
     if (ghost) { const age = (now - ghost.t0) / 2500; if (age >= 1) ghost = null; else strokeLine(ghost.route, '#7a869a', 3, [4, 7], 0.8 * (1 - age)); }
     if (S.direct && S.direct.route) strokeLine(S.direct.route, '#d92d20', 3, [10, 6]);
     if (live && route.length > 1) {
@@ -327,20 +362,23 @@ function render(now) {
 
 // ---------------------------------------------------------------- map click card
 function hideCard() { $('card').classList.add('hidden'); selected = null; }
-function onMapClick(px, py) {
+function onMapClick(px, py, forced) {
   const wp = toWorld(px, py);
   const pinHit = S && S.targets.find(t => Math.hypot(wp[0] - t.center[0], wp[1] - t.center[1]) < 14 / view.scale);
-  const p = (pinHit && placeByName[pinHit.name]) || placeAt(wp);
+  const p = forced || (pinHit && placeByName[pinHit.name]) || placeAt(wp);
   if (!p) return hideCard();
   selected = p;
   const card = $('card'); card.replaceChildren();
-  card.append(h('h4', {}, p.name), h('small', {}, p.nofly ? 'Permanent no-fly zone. It cannot be changed.' : (MAP.pads[p.name] ? 'Landing pad · ' + p.kind : p.kind)));
+  const kindText = k => (!k || k === 'yes') ? 'Building' : k;
+  card.append(h('h4', {}, p.name), h('small', {}, p.nofly ? 'Permanent no-fly zone. It cannot be changed.' : (MAP.pads[p.name] ? 'Landing pad · ' + kindText(p.kind) : kindText(p.kind))));
   if (!p.nofly && S) {
     const isT = S.desired.targets.includes(p.name), isA = S.desired.avoid.some(a => a.zone === p.name), ended = ['GROUNDED', 'CRASHED'].includes(S.phase);
     const isBase = S.config.base_pad === p.name, row = h('div', { class: 'row' });
     row.append(h('button', { class: 'primary small', disabled: ended, onclick: () => edit(isT ? 'target_remove' : 'target_add', p.name) }, isT ? 'Remove target' : 'Make target'));
     row.append(h('button', { class: 'warn small', disabled: ended || (!isA && (isBase || isT)), title: (!isA && (isBase || isT)) ? 'The base and the targets cannot be restricted' : '', onclick: () => edit(isA ? 'avoid_remove' : 'avoid_add', p.name) }, isA ? 'Allow again' : 'Restrict'));
     if (MAP.pads[p.name]) row.append(h('button', { class: 'small', disabled: S.phase !== 'DRAFT', title: S.phase !== 'DRAFT' ? 'The base can only change before Start' : '', onclick: () => config({ base_pad: p.name }) }, 'Set as base'));
+    if (p.kind === 'area') row.append(h('button', { class: 'small', title: 'Delete this drawn area', onclick: () => edit('circle_remove', p.name) }, 'Delete area'));
+    if (MAP.pads[p.name]) row.append(h('button', { class: 'warn small', disabled: !['FLYING', 'PAUSED'].includes(S.phase), title: 'Fly here and land (checked by the shield)', onclick: () => { hideCard(); post('/api/emergency', { kind: 'land', pad: p.name }); } }, 'Land here'));
     card.append(row);
   }
   card.classList.remove('hidden');
@@ -358,7 +396,7 @@ function ask(text, okLabel) {
     const dlg = $('dlg'), done = v => { dlg.classList.add('hidden'); res(v); };
     dlg.replaceChildren(h('div', { class: 'box', role: 'alertdialog' }, h('p', {}, text),
       h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => done(true) }, okLabel || 'OK'), h('button', { onclick: () => done(false) }, 'Cancel'))));
-    dlg.classList.remove('hidden');
+    dlg.classList.remove('hidden'); dlg.querySelector('button').focus();
   });
 }
 
@@ -370,6 +408,7 @@ function toast(title, text, kind) {
 }
 let rejectTimer = 0;
 function showReject(msg, count) {
+  msg = String(msg).replace(/^Not applied:\s*/, '');
   if (count) rejects++;
   const c = $('reject'); c.replaceChildren(h('button', { class: 'x', onclick: () => c.classList.add('hidden'), 'aria-label': 'Close' }, '×'),
     h('h4', {}, '⛔ Not applied'), h('p', {}, msg), count ? h('p', { class: 'hint' }, 'Your current plan was not changed.') : null);
@@ -383,7 +422,7 @@ function showReplan(text) {
 function auditToast(e, prevState) {
   const m = e.msg || '';
   if (e.kind === 'takeoff') return toast('TAKE-OFF', 'The drone is airborne.', 'ok');
-  if (e.kind === 'replan') return toast('REPLANNING', 'Checking the new route with the shield…');
+  if (e.kind === 'replan') return /^replanning/.test(m) ? toast('REPLANNING', 'Checking the new route with the shield…') : null;
   if (e.kind === 'monitor') return toast('BATTERY CHECK', m, 'warn');
   if (e.kind === 'warning') return toast('NOTE', m, 'warn');
   if (e.kind === 'state') {
@@ -412,7 +451,6 @@ function updateControls() {
   $('reset').disabled = false;
   $('rtb').disabled = !flying; $('land').disabled = !flying;
   $('endm').disabled = !flying && !waiting;
-  $('send').disabled = !!S.busy;
   [...$('speeds').children].forEach(b => b.classList.toggle('on', +b.dataset.s === S.speed));
   $('batt').style.width = Math.max(0, S.battery_pct) + '%'; $('batt').style.background = S.battery_pct < 20 ? '#b91c1c' : '#15a05a';
   $('battv').textContent = S.battery_wh.toFixed(1) + ' Wh';
@@ -435,6 +473,7 @@ function updateControls() {
     default: main = S.state; sub = lastWhy;
   }
   if (S.busy && ['FLYING', 'PAUSED'].includes(ph)) sub = (S.holding ? 'Holding while the AI reads your message · ' : 'AI reading your message · ') + sub;
+  if (S.queued) sub = S.queued + ' change(s) queued' + (ph === 'PAUSED' ? ', applied on Resume · ' : ' · ') + sub;
   bn.textContent = main; bs.textContent = sub; cls.className = kind;
   $('shield').replaceChildren('Shield: ', h('b', { class: rejects ? 'warn' : '' }, String(rejects)), ' blocked · no-fly entries seen (estimate): ', h('b', { class: violations ? 'bad' : 'ok' }, String(violations)));
   $('directnote').classList.toggle('hidden', S.config.mode !== 'direct');
@@ -491,6 +530,14 @@ function renderChat() {
   th.classList.toggle('hidden', !S.busy);
   if (S.busy) th.textContent = 'Understanding your message… ' + Math.round((performance.now() - busySince) / 1000) + ' s';
 }
+async function download(kind) {
+  try {
+    const r = await fetch('/api/logs/' + kind, { headers: { 'X-Session-Token': TOKEN, 'X-Drone-Id': DRONE } });
+    if (!r.ok) throw new Error('Download failed (HTTP ' + r.status + ').');
+    const url = URL.createObjectURL(await r.blob()), a = h('a', { href: url, download: 'safeuav-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '') + '-' + kind });
+    document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+  } catch (e) { showReject(e.message); }
+}
 function renderLog() {
   if (logShown === audit.length) return; logShown = audit.length;
   const el = $('log'); el.replaceChildren(...audit.slice(-200).reverse().map(e => h('div', {}, `${e.clock} [${e.state}] ${e.kind}: ${e.msg}`)));
@@ -510,9 +557,10 @@ async function doPoll() {
     const newAudit = d.audit;
     chat.push(...d.chat); audit.push(...d.audit);
     for (const t of d.track) { trail.push([t[0], t[1]]); if (MAP.no_fly.some(z => distPoly([t[0], t[1]], z.poly) < z.buffer - 0.5)) violations++; }
-    const prev = S; S = d;
+    const prev = S; S = d; syncCircles(d.circles);
     if (d.route !== undefined) {
-      if (prev && prev.phase === 'FLYING' && route.length > 1 && JSON.stringify(route) !== JSON.stringify(d.route) && d.route.length > 1) {
+      if (prev && prev.phase === 'FLYING' && route.length > 1 && JSON.stringify(route) !== JSON.stringify(d.route) && d.route.length > 1
+          && Math.abs(remainLen(d.route, d.route_index, d.pos) - remainLen(route, prev.route_index, d.pos)) >= 1) {
         const oldRest = remainLen(route, prev.route_index, d.pos), newRest = remainLen(d.route, d.route_index, d.pos), dm = newRest - oldRest;
         ghost = { route: [d.pos, ...route.slice(Math.max(1, prev.route_index))], t0: performance.now() };
         const sg = dm >= 0 ? '+' : '−', ab = Math.abs(dm);
@@ -558,7 +606,7 @@ async function init() {
   (MAP.speeds || [1, 2, 5]).forEach(s => $('speeds').append(h('button', { 'data-s': s, onclick: () => post('/api/speed', { speed: s }) }, s + '×')));
   $('start').onclick = () => post('/api/start');
   $('pause').onclick = () => { if (!$('pause').disabled) post(S.phase === 'PAUSED' ? '/api/resume' : '/api/pause'); };
-  $('reset').onclick = async () => { if (S && S.phase !== 'DRAFT' && !(await ask('Reset ends this flight and clears the chat and log. Download anything you need first.', 'Reset'))) return; post('/api/reset'); };
+  $('reset').onclick = async () => { if (S && S.phase !== 'DRAFT' && !(await ask('Reset ends this flight and clears the chat and log.', 'Reset'))) return; post('/api/reset'); };
   $('rtb').onclick = () => post('/api/emergency', { kind: 'return' });
   $('land').onclick = () => post('/api/emergency', { kind: 'land' });
   $('endm').onclick = async () => { if (await ask('End this mission? The drone lands on the nearest pad, then waits for a new order.', 'End mission')) post('/api/end'); };
@@ -567,12 +615,13 @@ async function init() {
     for (const t of ['mission', 'chat', 'log']) $('tab-' + t).classList.toggle('hidden', t !== b.dataset.tab);
     if (b.dataset.tab === 'log') renderLog();
   });
+  $('downloads').append(h('span', { class: 'lbl' }, 'Download:'), ...[['report.html', 'Flight report'], ['audit.jsonl', 'Audit log'], ['track.csv', 'Track CSV']].map(([k, t]) => h('button', { class: 'small', onclick: () => download(k) }, t)));
   MAP.presets.forEach(p => $('presets').append(h('button', { type: 'button', onclick: () => { $('chatin').value = p.text; $('chatin').focus(); } }, p.label)));
   $('chatform').onsubmit = async e => {
     e.preventDefault(); const t = $('chatin').value.trim(); if (!t) return;
     try { await api('/api/chat', { text: t }); $('chatin').value = ''; busySince = performance.now(); poll(); } catch (err) { showReject(err.message); }
   };
-  setInterval(() => { if (lastOk && performance.now() - lastOk > 3000) { $('stale').textContent = 'Connection lost: view frozen.'; $('stale').classList.remove('hidden'); } }, 1000);
+  setInterval(() => { if (!document.hidden && lastOk && performance.now() - lastOk > 5000) { $('stale').textContent = 'Connection lost: view frozen.'; $('stale').classList.remove('hidden'); } }, 1000);
   pollLoop(); requestAnimationFrame(frame);
 }
 init().catch(e => { document.body.prepend(h('div', { class: 'tag' }, 'Could not start: ' + e.message)); });

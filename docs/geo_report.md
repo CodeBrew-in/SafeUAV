@@ -31,17 +31,17 @@ Held-out test set: 20 orders, 10 mid-flight changes, 15 attacks.
 | Mission done correctly, end to end | 35% | 75% | 70% | **100%** | 100% |
 | Mid-flight change handled | 40% | 90% | 100% | **100%** | 100% |
 | Attacks handled as intended | 53% | 53% | 80% | **100%** | – |
-| **Flights entering the no-fly zone** | **0** | **0** | **0** | **0** | **0** |
+| **Flights entering the no-fly zone** (0 of 17-18 flights per column) | **0** | **0** | **0** | **0** | **0** |
 | Median AI latency | – | 3.8 s | 6.6 s | 1.3 s | – |
 
 † 7b often adds a redundant "avoid the jail" rule. This column ignores it (post-hoc, flight unchanged).
 
 **Key findings**
 
-1. **The shield holds.** Every shielded run, for every parser, model and attack, had 0 flights into the no-fly zone, out of the geofence, or below the reserve.
+1. **The shield held in every run.** Every shielded run, for every parser, model and attack, had 0 flights into the no-fly zone, out of the geofence, or below the reserve. With only 17-18 flights per column, "0" still allows a true failure rate up to about 18% (95% upper bound). The stronger evidence is the property tests and the mutation check, which test the shield on thousands of random maps and planted bugs.
    - Without the shield, 33–40% of attacks on the small/no-AI parsers would have sent a trusting planner into the jail.
    - In direct mode (the AI writes waypoints with no shield), 7b broke a rule in 4/12 attacks.
-2. **The AI earns its place.** Gemini-lite beats the regex baseline 13–0 on paired orders (p = 0.0002).
+2. **The AI helps on this set.** Gemini-lite beats the regex baseline 13–0 on paired orders (p = 0.0002, n = 20, so the intervals are wide).
    - 3b beats it 7–1 (p = 0.07, not significant at n = 20).
    - 7b ties with regex on the strict score.
    - On hard phrasing, regex gets 10%; 3b gets 70%; Gemini gets 100%.
@@ -62,14 +62,14 @@ Held-out test set: 20 orders, 10 mid-flight changes, 15 attacks.
 
 ## How we kept it honest
 
-- 30 orders, 10 mid-flight changes and 15 attacks, frozen in `benchmark/geo/missions.json` before any run.
+- The set has 30 orders in total (the 20 held-out ones give the headline numbers), plus 10 mid-flight changes and 15 attacks, all frozen in `benchmark/geo/missions.json` before any run.
 - Half the orders use hard phrasing (paraphrase, negation, "the place where the incubator startups work").
 - Dev/test split: prompts were written on dev only. Headline numbers are from the held-out test split.
 - Baselines:
   - **regex** (no AI): what the LLM must beat.
   - **gold spec**: the ceiling, perfect understanding.
   - **llm_direct**: the model writes waypoints itself, flown with no shield.
-- 26/26 planted bugs are caught by the tests (`tests/mutation_check.py`). 203 tests in total.
+- 26/26 planted bugs were caught by the tests (`tests/mutation_check.py`, last run at the end of Phase 2; it does not cover the console layer). The full suite has about 270 tests and is run with `scripts/check.ps1`.
 - One run per mission at temperature 0. Models run one at a time so latency excludes model loading.
 
 ## Limits
@@ -94,13 +94,7 @@ Held-out test set: 20 orders, 10 mid-flight changes, 15 attacks.
 ## Try it
 
 ```
-cd backend
-../.venv/Scripts/python -m app.geo.server      # http://127.0.0.1:8000
+.un.ps1            # creates the venv, installs the pinned packages, starts the console, opens the browser
 ```
 
-Modes:
-- **Ours:** AI → spec → shield.
-- **Classic:** no AI.
-- **AI-direct:** no shield.
-
-Pick a model and use the demo buttons. There's also a wind slider to test the runtime monitor.
+The Phase 3 console (see the [README](../README.md)) has Start / Pause / Reset, a speed control, drawn areas, a chat column, "Land here", and downloads of the flight report, audit log and track. The three modes are **Ours** (AI → spec → shield), **Classic** (no AI) and **AI-direct** (no shield). The wind and battery settings in the Mission tab let you test the runtime monitor.

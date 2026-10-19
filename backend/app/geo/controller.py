@@ -45,6 +45,7 @@ class Command:
     kind: str                      # "order" (a full spec), "return", "land"
     spec: MissionSpec | None = None
     text: str = ""                 # the operator's words, for the audit log
+    pad: str | None = None         # "land" only: land at this pad instead of the nearest one
 
 
 @dataclass
@@ -170,7 +171,7 @@ class Controller:
         elif cmd.kind == "return":
             self._go_home("operator: return now")
         elif cmd.kind == "land":
-            self._go_to_pad("operator: land now")
+            self._go_to_pad("operator: land now", cmd.pad)
 
     def _apply_order(self, spec: MissionSpec) -> None:
         airborne = self.state in FLYING
@@ -257,11 +258,40 @@ class Controller:
                     return
         self._go_to_pad(why + "; base not reachable")
 
-    def _go_to_pad(self, why: str) -> None:
+    def land_plan(self, pad_name: str) -> tuple[Plan | None, str]:
+        """A route to one chosen pad, through the same shield rules as every other route.
+        Returns (plan, "") or (None, the reason in plain words)."""
+        p = self.c.pads.get(pad_name)
+        if p is None:
+            return None, "that is not a landing pad"
+        air = self.airspace(self.spec)
+        if air.violation(p) is not None:
+            return None, f"{pad_name} is inside {air.violation(p)}"
+        esc = escape_path(air, self.pos) if self.state in FLYING else [self.pos]
+        if not esc:
+            return None, "no safe exit from the forbidden area"
+        tail = plan_through(air, esc[-1], [p])
+        if tail is None:
+            return None, f"no safe path to {pad_name}"
+        route = esc[:-1] + tail
+        need = route_energy_wh(route, self.actual.scaled(MEASURED_MARGIN)) + LANDING_WH
+        have = self.energy - self.floor_wh() * 0.25
+        if need > have:
+            return None, f"{pad_name} needs {need:.1f} Wh but only {max(0.0, have):.1f} Wh is available above the reserve"
+        return Plan(route, "to_pad", pad_name, len(esc) - 1), ""
+
+    def _go_to_pad(self, why: str, pad: str | None = None) -> None:
         if self.state not in FLYING:
             self._set_state("LANDED_WAIT", why + " (already on the ground)")
             self.landed_at = self.landed_at if self.landed_at is not None else self.t
             return
+        if pad:
+            plan, reason = self.land_plan(pad)
+            if plan is not None:
+                self._swap(plan, why)
+                self._set_state("TO_PAD", f"{why}: landing at pad {pad}")
+                return
+            self._log("order_rejected", f"cannot land at {pad}: {reason}; landing at the nearest pad instead")
         air = self.airspace(self.spec)
         found = route_to_nearest_pad(air, self.pos, self.actual.scaled(MEASURED_MARGIN), self.energy,
                                      self.floor_wh() * 0.25)

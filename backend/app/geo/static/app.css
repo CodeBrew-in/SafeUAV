@@ -127,10 +127,13 @@ label.f input, label.f select { font: inherit; padding: 4px 6px; border: 1px sol
 #dlg .box p { margin: 0 0 14px; font-size: 15px; }
 #dlg .row { display: flex; gap: 8px; justify-content: flex-end; }
 #toasts { top: 76px; }
-#replan { top: auto; bottom: 64px; right: 12px; }
-#replan.right { top: auto; }
 @media (max-width: 1000px) {
   main { grid-template-rows: minmax(340px, 55vh) auto; }
   #side { overflow: visible; min-height: 560px; }
   .tab { max-height: none; }
 }
+
+#chat:empty::before { content: 'Type an order below, or pick an example. Try: "Inspect the Library, then come back".'; color: var(--muted); font-size: 14px; display: block; padding: 8px; }
+#mapctl button[aria-pressed=true] { background: #1d5fd1; color: #fff; }
+#downloads { flex-wrap: wrap; margin-bottom: 8px; }
+.attrib { margin-left: auto; color: var(--muted); font-size: 11px; }
