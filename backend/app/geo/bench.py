@@ -437,6 +437,8 @@ def main() -> None:
                 continue
             if model not in llms:
                 llms[model] = make_llm(model)
+                if isinstance(llms[model], OllamaLLM):  # load the model before timing anything
+                    llms[model].ask("Reply with JSON.", "{}", {"type": "object"}, max_tokens=8)
             t0 = time.perf_counter()
             if sec == "base":
                 res = run_base(m, arm, model, llms[model])
