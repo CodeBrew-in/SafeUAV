@@ -636,6 +636,13 @@ class Session:
         return ("ai", r)
 
     @staticmethod
+    def _short_reason(msg: str | None) -> str:
+        """Why the AI did not answer, in a few safe words: no keys, no addresses, no stack traces."""
+        m = re.sub(r"^AI error \(|\): message not applied\.?$", "", str(msg or "no answer"))
+        m = re.sub(r"AIza[0-9A-Za-z_\-]{10,}|key=[^&\s]+|https?://\S+", "[hidden]", m)
+        return m.strip()[:140] or "no answer"
+
+    @staticmethod
     def _prioritize(new: MissionSpec, old: MissionSpec, text: str) -> MissionSpec:
         """"Divert to X" / "go to X now": the new stops come first, the rest of the mission follows."""
         if not DIVERT_RE.search(text):
@@ -716,7 +723,8 @@ class Session:
                 cur = dataclasses.replace(cur, targets=())     # "only" / "instead": replace, don't append
             new = self._prioritize(apply_parts(cur, targets, avoid, stay), cur, text)
             self._commit(new, source="chat", text=text)
-            self.say("ai", ("AI unavailable: basic parser used. " if fallback else "Basic parser: ") + "Understood.",
+            note = f"AI unavailable ({self._short_reason(r.message)}): basic parser used. " if fallback else "Basic parser: "
+            self.say("ai", note + "Understood.",
                      status="fallback" if fallback else "applied", spec=new.to_json())
         except SessionError as e:
             self.say("system", f"Not applied: {e}", level="bad")

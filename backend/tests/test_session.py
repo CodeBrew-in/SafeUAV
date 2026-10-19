@@ -726,3 +726,12 @@ def test_end_mission_keeps_only_reached_targets_in_the_list():
     s.end_mission()
     run_ticks(s, 600)
     assert s.phase == "DONE" and DIR not in s.desired.targets
+
+
+def test_the_fallback_message_says_why_without_leaking_a_key():
+    err = "HTTP 400: API key not valid. key=AIzaSyABCDEFGHIJKLMNOPQRSTUVWXYZ012345 at https://example.com/x?key=abc"
+    s = sess(FakeLLM(error=err))
+    s.edit("target_add", LIB)
+    s.handle("also inspect the directorate")
+    text = [c["text"] for c in s.chat if c["who"] == "ai"][-1]
+    assert "400" in text and "AIza" not in text and "https://" not in text and "basic parser used" in text
