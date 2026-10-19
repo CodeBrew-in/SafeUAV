@@ -11,13 +11,15 @@ area (the geofence).
 
 from __future__ import annotations
 
+import hashlib
 import re
+import unicodedata
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-from .geometry import Point, Polygon, Projection, bbox, centroid, distance_to_polygon
+from .geometry import Point, Polygon, Projection, bbox, distance_to_polygon, interior_point
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 OSM_FILE = REPO_ROOT / "benchmark" / "geo" / "thapar_osm.xml"
@@ -26,10 +28,18 @@ OSM_FILE = REPO_ROOT / "benchmark" / "geo" / "thapar_osm.xml"
 PERMANENT_NO_FLY = {"Central Jail Patiala": 30.0}
 GEOFENCE_MARGIN_M = 25.0      # stay this far inside the mapped area
 BASE_NAME = "Football Ground"  # launch and recovery point
+# Designated landing pads (assumed marked pads on open ground; the base is one of them).
+# SAFE_HOLD and EMERGENCY may only land on these, never on roofs or arbitrary pitches.
+LANDING_PADS = ("Football Ground", "Fete Area", "SBOP lawns", "Nirvana Meditation Park")
 
 
 def norm(name: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", name.lower())
+    """Comparison key: Unicode NFKC, case-folded, letters and digits only (any script).
+    Raises ValueError for names with no letters or digits, so '' never matches anything."""
+    key = re.sub(r"[\W_]+", "", unicodedata.normalize("NFKC", str(name)).casefold())
+    if not key:
+        raise ValueError(f"place name {name!r} has no letters or digits")
+    return key
 
 
 @dataclass(frozen=True)
@@ -48,10 +58,14 @@ class Campus:
     permanent_no_fly: dict[str, tuple[Polygon, float]]  # name -> (polygon, buffer m)
     fence: tuple[float, float, float, float]  # xmin, ymin, xmax, ymax after the margin
     base: Point
-    extra: dict = field(default_factory=dict)
+    pads: dict[str, Point] = field(default_factory=dict)  # landing pad name -> touchdown point
+    osm_sha256: str = ""
 
     def find(self, name: str) -> Place | None:
-        return self.places.get(norm(name))
+        try:
+            return self.places.get(norm(name))
+        except ValueError:
+            return None
 
     def in_fence(self, p: Point) -> bool:
         x0, y0, x1, y1 = self.fence
@@ -86,9 +100,12 @@ def load_campus(path: str = str(OSM_FILE)) -> Campus:
         if not all(r in nodes for r in refs):
             continue
         poly = tuple(nodes[r] for r in refs[:-1])
-        key = norm(name)
+        try:
+            key = norm(name)
+        except ValueError:
+            continue
         counts[key] = counts.get(key, 0) + 1
-        places[key] = Place(name, kind, poly, centroid(list(poly)))
+        places[key] = Place(name, kind, poly, interior_point(list(poly)))
     ambiguous = {k for k, v in counts.items() if v > 1}
     for k in ambiguous:
         del places[k]
@@ -104,7 +121,9 @@ def load_campus(path: str = str(OSM_FILE)) -> Campus:
     x1, y1 = proj.to_xy(maxlat, maxlon)
     fence = (x0 + GEOFENCE_MARGIN_M, y0 + GEOFENCE_MARGIN_M, x1 - GEOFENCE_MARGIN_M, y1 - GEOFENCE_MARGIN_M)
     base = places[norm(BASE_NAME)].center
-    return Campus(proj, places, ambiguous, permanent, fence, base)
+    pads = {n: places[norm(n)].center for n in LANDING_PADS}
+    digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    return Campus(proj, places, ambiguous, permanent, fence, base, pads, digest)
 
 
 def describe_places(c: Campus) -> list[dict]:

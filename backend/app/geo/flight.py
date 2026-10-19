@@ -1,8 +1,8 @@
-"""Flight physics, the route planner, the safety shield and the simulator for the campus map.
+"""Flight physics, airspace, route planner, escape, landing pads and the preflight shield.
 
-Physics (stated simplifications): constant airspeed, constant electrical power in
-cruise, wind as a constant vector per flight, fixed altitude above all buildings.
-Ground speed along a leg follows from the wind triangle.
+Simulation assumptions (stated, not real-drone validated): fixed cruise altitude above
+all buildings, constant airspeed, constant power per flight phase, wind as a constant
+vector per flight. Ground speed along a leg follows from the wind triangle.
 """
 
 from __future__ import annotations
@@ -11,19 +11,30 @@ import heapq
 import math
 from dataclasses import dataclass, field
 
-from .campus import Campus, norm
+from .campus import Campus
 from .geometry import Point, dist, distance_to_polygon, path_length, sample_segment
 from .spec import MissionSpec
 
-AIRSPEED = 10.0          # m/s
-POWER_W = 180.0          # cruise power draw
-RESERVE_FRACTION = 0.20  # battery that must remain on landing (preflight rule)
-CRASH_RESERVE_WH = 0.0   # below this the drone falls out of the sky
-VISIT_RADIUS = 15.0      # passing within this distance of a target's centre counts as inspecting it
-CELL = 10.0              # planner grid resolution, metres
-PLAN_MARGIN = 10.0       # planner keeps this much extra clearance beyond each rule's buffer
-AVOID_BUFFER = 10.0      # clearance the shield requires around mission avoid-zones
-SAMPLE = 2.0             # shield checks route segments every SAMPLE metres
+# --- physics and energy ------------------------------------------------------------------------
+AIRSPEED = 10.0        # m/s
+CRUISE_W = 180.0       # electrical power in cruise
+HOVER_W = 200.0        # hovering in place (waiting for a decision)
+IDLE_W = 8.0           # landed, avionics on, waiting for orders
+TAKEOFF_WH = 2.0       # climb to cruise altitude
+LANDING_WH = 1.2       # descent and touchdown
+FLOOR_FRACTION = 0.10  # never plan to land with less than this share of a full battery
+FORECAST_MARGIN = 1.25 # planning assumes wind this much stronger than forecast
+MEASURED_MARGIN = 1.10 # the in-flight monitor uses measured wind plus this margin
+MAX_WAIT_MIN = 30      # longest a drone sits on a pad before it must be collected
+
+# --- geometry rules ----------------------------------------------------------------------------
+VISIT_RADIUS = 15.0    # passing within this distance of a target's reference point inspects it
+CELL = 10.0            # planner grid resolution
+PLAN_MARGIN = 10.0     # extra clearance the planner keeps away from route end points
+AVOID_BUFFER = 10.0    # clearance the shield requires around mission avoid-zones
+SAMPLE = 2.0           # shield checks route segments every SAMPLE metres
+MAX_COORD = 100_000.0  # any coordinate beyond this is rejected before geometry runs
+MAX_LEG = 5_000.0      # longest straight leg accepted
 
 
 @dataclass(frozen=True)
@@ -36,40 +47,52 @@ class Wind:
         to = math.radians(self.from_deg + 180.0)
         return (self.speed * math.sin(to), self.speed * math.cos(to))
 
+    def scaled(self, k: float) -> "Wind":
+        return Wind(self.speed * k, self.from_deg)
+
+
+def flyable_weather(wind: Wind) -> bool:
+    return wind.speed < 0.8 * AIRSPEED
+
 
 def ground_speed(a: Point, b: Point, wind: Wind) -> float:
-    """Ground speed flying a->b with constant airspeed; 0 if the wind makes it impossible."""
+    """Ground speed flying a->b at constant airspeed; 0 if the wind makes it impossible."""
     L = dist(a, b)
     if L == 0:
         return AIRSPEED
     ux, uy = (b[0] - a[0]) / L, (b[1] - a[1]) / L
     wx, wy = wind.vector
     w_par = wx * ux + wy * uy
-    w_perp2 = (wx * wx + wy * wy) - w_par * w_par
+    w_perp2 = max(0.0, (wx * wx + wy * wy) - w_par * w_par)
     if w_perp2 >= AIRSPEED * AIRSPEED:
         return 0.0
-    g = w_par + math.sqrt(AIRSPEED * AIRSPEED - w_perp2)
-    return max(g, 0.0)
+    return max(w_par + math.sqrt(AIRSPEED * AIRSPEED - w_perp2), 0.0)
 
 
 def route_energy_wh(route: list[Point], wind: Wind) -> float:
-    """Energy to fly the route; inf if any leg cannot be flown against the wind."""
+    """Cruise energy to fly the route; inf if a leg cannot be flown against the wind."""
     seconds = 0.0
     for a, b in zip(route, route[1:]):
         g = ground_speed(a, b, wind)
-        if g <= 0.1:
+        if g <= 0.5:
             return math.inf
         seconds += dist(a, b) / g
-    return POWER_W * seconds / 3600.0
+    return CRUISE_W * seconds / 3600.0
 
 
-# --- forbidden-space queries -----------------------------------------------------------------
+def horizon_min(battery_wh: float) -> float:
+    """Longest a full battery can keep the drone airborne, in minutes: the planning horizon."""
+    return battery_wh / CRUISE_W * 60.0
+
+
+# --- airspace ---------------------------------------------------------------------------------------
 
 @dataclass
 class Airspace:
-    """Everything the drone must stay out of for one mission, with the buffers to use."""
+    """What the drone must stay out of. Permanent rules and the geofence always apply;
+    `avoid_polys` are the mission's avoid-zones that are in force over the planning window."""
     campus: Campus
-    avoid_polys: list[tuple[str, list[Point], float]] = field(default_factory=list)  # name, poly, buffer
+    avoid_polys: list[tuple[str, list[Point], float]] = field(default_factory=list)
 
     @classmethod
     def for_spec(cls, campus: Campus, spec: MissionSpec | None, t0: float, t1: float) -> "Airspace":
@@ -81,36 +104,55 @@ class Airspace:
                     polys.append((p.name, list(p.polygon), AVOID_BUFFER))
         return cls(campus, polys)
 
-    def violation(self, p: Point, extra: float = 0.0) -> str | None:
-        """Why p is forbidden (with `extra` clearance added to every buffer), or None."""
-        if not self.campus.in_fence(p) if extra == 0 else not _in_fence(self.campus, p, extra):
+    def key(self) -> tuple:
+        return tuple(sorted(n for n, _, _ in self.avoid_polys))
+
+    def violation(self, p: Point, extra: float = 0.0, *, mission: bool = True) -> str | None:
+        """Why p is forbidden (each buffer grown by `extra`), or None.
+        mission=False checks only the permanent rules and the geofence."""
+        x0, y0, x1, y1 = self.campus.fence
+        if not (x0 + extra <= p[0] <= x1 - extra and y0 + extra <= p[1] <= y1 - extra):
             return "geofence"
         for name, (poly, buf) in self.campus.permanent_no_fly.items():
             if distance_to_polygon(p, poly) < buf + extra:
-                return f"no-fly: {name}"
-        for name, poly, buf in self.avoid_polys:
-            if distance_to_polygon(p, poly) < buf + extra:
-                return f"avoid: {name}"
+                return f"no-fly zone {name}"
+        if mission:
+            for name, poly, buf in self.avoid_polys:
+                if distance_to_polygon(p, poly) < buf + extra:
+                    return f"avoid-zone {name}"
+        return None
+
+    def segment_violation(self, a: Point, b: Point, *, mission: bool = True) -> str | None:
+        for p in sample_segment(a, b, SAMPLE):
+            why = self.violation(p, mission=mission)
+            if why:
+                return why
         return None
 
 
-def _in_fence(c: Campus, p: Point, extra: float) -> bool:
-    x0, y0, x1, y1 = c.fence
-    return x0 + extra <= p[0] <= x1 - extra and y0 + extra <= p[1] <= y1 - extra
+# --- planner -------------------------------------------------------------------------------------------
 
+_GRID_CACHE: dict[tuple, list[list[bool]]] = {}
 
-# --- planner ---------------------------------------------------------------------------------------
 
 class GridPlanner:
-    """8-connected A* on a 10 m grid, then shortcutting with exact line-of-sight checks."""
+    """8-connected A* on a 10 m grid, then shortcutting with exact line-of-sight checks.
+
+    Interior points of a leg keep PLAN_MARGIN/2 extra clearance; points within
+    2*PLAN_MARGIN of the leg's ends only need the shield's own buffer, so a start or
+    goal that sits just outside a zone (where the shield allows it) is still reachable.
+    """
 
     def __init__(self, airspace: Airspace):
         self.air = airspace
         x0, y0, x1, y1 = airspace.campus.fence
         self.x0, self.y0 = x0, y0
         self.nx, self.ny = int((x1 - x0) // CELL) + 1, int((y1 - y0) // CELL) + 1
-        self.blocked = [[airspace.violation(self.center((i, j)), PLAN_MARGIN) is not None
-                         for j in range(self.ny)] for i in range(self.nx)]
+        key = (id(airspace.campus), airspace.key())
+        if key not in _GRID_CACHE:
+            _GRID_CACHE[key] = [[airspace.violation(self.center((i, j)), PLAN_MARGIN) is not None
+                                 for j in range(self.ny)] for i in range(self.nx)]
+        self.blocked = _GRID_CACHE[key]
 
     def center(self, c: tuple[int, int]) -> Point:
         return (self.x0 + c[0] * CELL, self.y0 + c[1] * CELL)
@@ -119,31 +161,39 @@ class GridPlanner:
         return (min(self.nx - 1, max(0, round((p[0] - self.x0) / CELL))),
                 min(self.ny - 1, max(0, round((p[1] - self.y0) / CELL))))
 
-    def clear(self, a: Point, b: Point) -> bool:
-        return all(self.air.violation(p, PLAN_MARGIN / 2) is None for p in sample_segment(a, b, SAMPLE))
+    def clear(self, a: Point, b: Point, ends: tuple[Point, ...] = ()) -> bool:
+        for p in sample_segment(a, b, SAMPLE):
+            near_end = any(dist(p, e) <= 2 * PLAN_MARGIN for e in ends)
+            if self.air.violation(p, 0.0 if near_end else PLAN_MARGIN / 2) is not None:
+                return False
+        return True
 
     def leg(self, a: Point, b: Point) -> list[Point] | None:
+        """Shortest safe path a->b, or None. Both ends must themselves be legal."""
         if self.air.violation(a) or self.air.violation(b):
             return None
-        if self.clear(a, b):
+        ends = (a, b)
+        if self.clear(a, b, ends):
             return [a, b]
-        s, g = self.cell_of(a), self.cell_of(b)
-        if self.blocked[s[0]][s[1]] or self.blocked[g[0]][g[1]]:
-            s, g = self._nearest_free(s), self._nearest_free(g)
-            if s is None or g is None:
-                return None
+        s, g = self._nearest_free(a), self._nearest_free(b)
+        if s is None or g is None:
+            return None
         cells = self._astar(s, g)
         if cells is None:
             return None
-        pts = [a] + [self.center(c) for c in cells] + [b]
-        return self._shortcut(pts)
+        return self._shortcut([a] + [self.center(c) for c in cells] + [b], ends)
 
-    def _nearest_free(self, c):
-        for r in range(1, 4):
-            for i in range(c[0] - r, c[0] + r + 1):
-                for j in range(c[1] - r, c[1] + r + 1):
-                    if 0 <= i < self.nx and 0 <= j < self.ny and not self.blocked[i][j]:
-                        return (i, j)
+    def _nearest_free(self, p: Point):
+        """Closest free cell connected to p by a clear straight line (searched in distance order)."""
+        c0 = self.cell_of(p)
+        cands = []
+        for i in range(c0[0] - 5, c0[0] + 6):
+            for j in range(c0[1] - 5, c0[1] + 6):
+                if 0 <= i < self.nx and 0 <= j < self.ny and not self.blocked[i][j]:
+                    cands.append((dist(p, self.center((i, j))), (i, j)))
+        for _, c in sorted(cands):
+            if self.clear(p, self.center(c), (p,)) or self.air.segment_violation(p, self.center(c)) is None:
+                return c
         return None
 
     def _astar(self, s, g):
@@ -177,38 +227,85 @@ class GridPlanner:
                         heapq.heappush(openh, (nc + h(n), nc, n))
         return None
 
-    def _shortcut(self, pts: list[Point]) -> list[Point] | None:
+    def _shortcut(self, pts: list[Point], ends) -> list[Point] | None:
         out = [pts[0]]
         i = 0
         while i < len(pts) - 1:
             j = len(pts) - 1
-            while j > i + 1 and not self.clear(pts[i], pts[j]):
+            while j > i + 1 and not self.clear(pts[i], pts[j], ends):
                 j -= 1
-            if not self.clear(pts[i], pts[j]):
+            if not self.clear(pts[i], pts[j], ends) and self.air.segment_violation(pts[i], pts[j]):
                 return None
             out.append(pts[j])
             i = j
         return out
 
 
-def plan_route(campus: Campus, spec: MissionSpec, start_min: float) -> tuple[list[Point] | None, str]:
-    """Base -> targets in order (-> base). Avoid rules active during the next hour are blocked."""
-    air = Airspace.for_spec(campus, spec, start_min, start_min + 60)
+def plan_through(air: Airspace, start: Point, stops: list[Point]) -> list[Point] | None:
+    """Chain safe legs start -> stops[0] -> stops[1] ..."""
     planner = GridPlanner(air)
-    stops = [campus.base] + [campus.find(t).center for t in spec.targets]
-    if spec.return_to_base:
-        stops.append(campus.base)
-    route: list[Point] = [stops[0]]
-    for a, b in zip(stops, stops[1:]):
-        leg = planner.leg(a, b)
+    route = [start]
+    for b in stops:
+        leg = planner.leg(route[-1], b)
         if leg is None:
-            name = next((t for t in spec.targets if campus.find(t).center == b), "base")
-            return None, f"no safe path to {name}"
+            return None
         route += leg[1:]
-    return route, f"route {path_length(route):.0f} m with {len(route)} waypoints"
+    return route
 
 
-# --- shield ------------------------------------------------------------------------------------------
+# --- escape and landing --------------------------------------------------------------------------------
+
+def escape_path(air: Airspace, pos: Point) -> list[Point] | None:
+    """If pos is inside a forbidden area, the shortest straight exit (+10 m) that never crosses
+    a permanent no-fly zone or the geofence it is not already inside. [pos] if already legal."""
+    if air.violation(pos) is None:
+        return [pos]
+    start_permanent = air.violation(pos, mission=False)
+    best = None
+    for k in range(72):
+        ang = 2 * math.pi * k / 72
+        ux, uy = math.cos(ang), math.sin(ang)
+        out_at, found = None, None
+        for s in range(1, 400):
+            p = (pos[0] + ux * s * 2.0, pos[1] + uy * s * 2.0)
+            if start_permanent is None and air.violation(p, mission=False):
+                break  # this direction runs into the jail or the fence
+            if air.violation(p) is None:
+                if out_at is None:
+                    out_at = s * 2.0
+                if s * 2.0 >= out_at + 10.0:
+                    found = (out_at, p)  # clear for the whole 10 m beyond the exit
+                    break
+            else:
+                out_at = None  # back inside (a courtyard): keep looking further out
+        if found and (best is None or found[0] < best[0]):
+            best = found
+    return None if best is None else [pos, best[1]]
+
+
+def usable_pads(air: Airspace) -> dict[str, Point]:
+    return {n: p for n, p in air.campus.pads.items() if air.violation(p) is None}
+
+
+def route_to_nearest_pad(air: Airspace, pos: Point, wind: Wind, energy_wh: float,
+                         floor_wh: float) -> tuple[str, list[Point]] | None:
+    """The cheapest reachable usable pad (escaping first if needed), within energy_wh - floor_wh."""
+    esc = escape_path(air, pos)
+    if esc is None:
+        return None
+    best = None
+    for name, pad in usable_pads(air).items():
+        tail = plan_through(air, esc[-1], [pad])
+        if tail is None:
+            continue
+        route = esc[:-1] + tail
+        e = route_energy_wh(route, wind) + LANDING_WH
+        if e <= energy_wh - floor_wh and (best is None or e < best[0]):
+            best = (e, name, route)
+    return None if best is None else (best[1], best[2])
+
+
+# --- preflight shield ----------------------------------------------------------------------------------
 
 @dataclass
 class ShieldResult:
@@ -217,129 +314,73 @@ class ShieldResult:
     energy_wh: float
 
 
-def preflight_check(route: object, campus: Campus, spec: MissionSpec | None, start_min: float,
-                    forecast: Wind, battery_wh: float) -> ShieldResult:
-    """Check a whole route before take-off. Permanent rules and the geofence always apply;
-    the spec's avoid-zones and targets apply when a spec is given."""
-    reasons: list[str] = []
-    pts = _coerce(route)
-    if pts is None:
-        return ShieldResult(False, ["route is not a list of [x, y] points"], math.inf)
-    if len(pts) < 2:
-        return ShieldResult(False, ["route has fewer than two points"], math.inf)
-    if dist(pts[0], campus.base) > VISIT_RADIUS:
-        reasons.append("route does not start at base")
-    air = Airspace.for_spec(campus, spec, start_min, start_min + 60)
-    for a, b in zip(pts, pts[1:]):
-        for p in sample_segment(a, b, SAMPLE):
-            why = air.violation(p)
-            if why:
-                reasons.append(f"enters {why} near ({p[0]:.0f}, {p[1]:.0f})")
-                break
-        if len(reasons) > 5:
-            break
-    if spec is not None:
-        if not visits_in_order(pts, [campus.find(t).center for t in spec.targets]):
-            reasons.append("does not visit every target in the requested order")
-        if spec.return_to_base and dist(pts[-1], campus.base) > VISIT_RADIUS:
-            reasons.append("does not return to base")
-    e = route_energy_wh(pts, forecast)
-    if e > battery_wh * (1 - RESERVE_FRACTION):
-        reasons.append(f"needs {e:.1f} Wh but only {battery_wh * (1 - RESERVE_FRACTION):.1f} Wh may be used "
-                       f"({RESERVE_FRACTION:.0%} reserve)")
-    return ShieldResult(not reasons, list(dict.fromkeys(reasons)), e)
-
-
-def _coerce(route: object) -> list[Point] | None:
-    if not isinstance(route, (list, tuple)) or len(route) > 5000:
+def coerce_route(route: object) -> list[Point] | None:
+    """Raw proposer output -> points, or None if malformed (bounds checked before any geometry)."""
+    if not isinstance(route, (list, tuple)) or not 2 <= len(route) <= 2000:
         return None
     out = []
     for p in route:
         if not (isinstance(p, (list, tuple)) and len(p) == 2
-                and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in p)):
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                        and abs(v) <= MAX_COORD for v in p)):
             return None
         out.append((float(p[0]), float(p[1])))
+    if any(dist(a, b) > MAX_LEG for a, b in zip(out, out[1:])):
+        return None
     return out
+
+
+def preflight_check(route: object, air: Airspace, *, start: Point, energy_wh: float, capacity_wh: float,
+                    forecast: Wind, airborne: bool, targets: list[Point], end_at: Point | None,
+                    escape_first: bool = False) -> ShieldResult:
+    """Check a whole route before it is flown (at take-off or when swapped in mid-flight).
+
+    Rules: starts where the drone is; never enters forbidden space; visits the targets in
+    order; ends at `end_at` (base or a pad); and the energy for the route (with a wind
+    margin), landing, any take-off and the floor reserve fits in what is left.
+    """
+    reasons: list[str] = []
+    pts = coerce_route(route)
+    if pts is None:
+        return ShieldResult(False, ["route is malformed, too long or out of bounds"], math.inf)
+    if dist(pts[0], start) > 1.0:
+        reasons.append("route does not start at the drone's position")
+    if path_length(pts) == 0:
+        reasons.append("route has zero length")
+    for i, (a, b) in enumerate(zip(pts, pts[1:])):
+        # the escape leg starts inside a mission zone; it must still respect the permanent rules
+        why = air.segment_violation(a, b, mission=not (escape_first and i == 0))
+        if why:
+            reasons.append(f"route enters {why}")
+            break
+    if not visits_in_order(pts, targets):
+        reasons.append("route does not visit every target in the requested order")
+    if end_at is not None and dist(pts[-1], end_at) > VISIT_RADIUS:
+        reasons.append("route does not end at its landing point")
+    if not flyable_weather(forecast):
+        reasons.append(f"wind {forecast.speed:.0f} m/s is too strong to fly")
+    e = route_energy_wh(pts, forecast.scaled(FORECAST_MARGIN)) + LANDING_WH + (0.0 if airborne else TAKEOFF_WH)
+    budget = energy_wh - FLOOR_FRACTION * capacity_wh
+    if e > budget:
+        reasons.append(f"needs {e:.1f} Wh but only {max(budget, 0):.1f} Wh is available above the reserve")
+    return ShieldResult(not reasons, reasons, e)
 
 
 def visits_in_order(track: list[Point], targets: list[Point], radius: float = VISIT_RADIUS) -> bool:
     """Does the track pass within `radius` of each target, in the given order?"""
+    return visit_count(track, targets, radius) == len(targets)
+
+
+def visit_count(track: list[Point], targets: list[Point], radius: float = VISIT_RADIUS) -> int:
+    """How many of the targets the track reaches, in order (a target counts only after the previous)."""
     if not targets:
-        return True
+        return 0
     k = 0
-    for a, b in zip(track, track[1:] or track):
+    pairs = list(zip(track, track[1:])) or [(track[0], track[0])]
+    for a, b in pairs:
         for p in sample_segment(a, b, SAMPLE):
-            while k < len(targets) and dist(p, targets[k]) <= radius:
-                k += 1
+            if k < len(targets) and dist(p, targets[k]) <= radius:
+                k += 1  # one target per sample point, so close neighbours are not skipped
             if k == len(targets):
-                return True
-    return k == len(targets)
-
-
-# --- simulator with runtime monitor ---------------------------------------------------------------
-
-@dataclass
-class FlightLog:
-    outcome: str                    # completed | returned_early | crashed_battery | refused
-    track: list[Point]
-    times: list[float]              # seconds after take-off, one per track point
-    seconds: float
-    energy_used_wh: float
-    battery_left_wh: float
-    events: list[str]
-
-
-def simulate(route: list[Point], campus: Campus, actual: Wind, battery_wh: float, *,
-             monitor: bool, start_min: float, dt: float = 1.0) -> FlightLog:
-    """Fly the route in the real (actual) wind. With `monitor` on, a runtime shield checks every
-    5 s whether the battery still covers the safest way home, and turns back if it does not."""
-    home_planner = GridPlanner(Airspace(campus)) if monitor else None
-    track = [route[0]]
-    times = [0.0]
-    energy = battery_wh
-    t = 0.0
-    events: list[str] = []
-    legs = list(zip(route, route[1:]))
-    li, pos = 0, route[0]
-    returning = False
-    while li < len(legs):
-        a, b = legs[li]
-        g = ground_speed(pos, b, actual)
-        if g <= 0.1:
-            events.append(f"t={t:.0f}s cannot make headway against the wind")
-            return FlightLog("crashed_battery", track, times, t, battery_wh - energy, energy, events)
-        step = g * dt
-        d = dist(pos, b)
-        if d <= step:
-            pos, li = b, li + 1
-            used_t = d / g
-        else:
-            pos = (pos[0] + (b[0] - pos[0]) * step / d, pos[1] + (b[1] - pos[1]) * step / d)
-            used_t = dt
-        t += used_t
-        energy -= POWER_W * used_t / 3600.0
-        track.append(pos)
-        times.append(t)
-        if energy <= CRASH_RESERVE_WH:
-            events.append(f"t={t:.0f}s battery empty at ({pos[0]:.0f}, {pos[1]:.0f})")
-            return FlightLog("crashed_battery", track, times, t, battery_wh, 0.0, events)
-        if monitor and not returning and int(t) % 5 == 0 and used_t == dt:
-            home = home_planner.leg(pos, campus.base)
-            need = route_energy_wh(home, actual) if home else math.inf
-            if energy - need * 1.15 < battery_wh * 0.05:
-                events.append(f"t={t:.0f}s runtime shield: {energy:.1f} Wh left, {need:.1f} Wh needed "
-                              f"to get home -> returning to base")
-                legs = list(zip(home, home[1:]))
-                li, returning = 0, True
-    outcome = "returned_early" if returning else "completed"
-    return FlightLog(outcome, track, times, t, battery_wh - energy, energy, events)
-
-
-def mission_start_from_text(hhmm: str) -> int:
-    h, m = hhmm.split(":")
-    return int(h) * 60 + int(m)
-
-
-def place_center(campus: Campus, name: str) -> Point:
-    p = campus.places[norm(name)]
-    return p.center
+                return k
+    return k

@@ -93,3 +93,27 @@ def sample_segment(a: Point, b: Point, step: float) -> list[Point]:
 
 def path_length(points: list[Point]) -> float:
     return sum(dist(points[i], points[i + 1]) for i in range(len(points) - 1))
+
+
+def interior_point(poly: Polygon) -> Point:
+    """A point guaranteed inside the polygon: the centroid if it is inside, otherwise the middle
+    of the widest horizontal chord near the centroid's height (concave shapes, L-shaped blocks)."""
+    c = centroid(poly)
+    if point_in_polygon(c, poly):
+        return c
+    x0, y0, x1, y1 = bbox(poly)
+    best, best_w = None, -1.0
+    for k in range(1, 40):
+        y = y0 + (y1 - y0) * k / 40
+        xs = []
+        n = len(poly)
+        for i in range(n):
+            (ax, ay), (bx, by) = poly[i], poly[(i + 1) % n]
+            if (ay > y) != (by > y):
+                xs.append(ax + (y - ay) * (bx - ax) / (by - ay))
+        xs.sort()
+        for a, b in zip(xs[0::2], xs[1::2]):
+            w = b - a - abs(y - c[1]) * 0.1  # prefer chords near the centroid
+            if w > best_w and point_in_polygon(((a + b) / 2, y), poly):
+                best, best_w = ((a + b) / 2, y), w
+    return best if best is not None else c
