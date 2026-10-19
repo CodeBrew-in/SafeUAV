@@ -262,8 +262,11 @@ class Controller:
         """A route to one chosen pad, through the same shield rules as every other route.
         Returns (plan, "") or (None, the reason in plain words)."""
         p = self.c.pads.get(pad_name)
-        if p is None:
-            return None, "that is not a landing pad"
+        if p is None:                         # any named place can be a landing spot; the checks below still apply
+            place = self.c.find(pad_name)
+            if place is None:
+                return None, "that is not a known place"
+            pad_name, p = place.name, place.center
         air = self.airspace(self.spec)
         if air.violation(p) is not None:
             return None, f"{pad_name} is inside {air.violation(p)}"
@@ -410,7 +413,7 @@ class Controller:
             self._set_state("DONE", "returned on operator command")
         elif purpose == "to_pad":
             self.landed_at = self.t
-            self._set_state("LANDED_WAIT", f"waiting on pad {self.plan.end_name} for a feasible order")
+            self._set_state("LANDED_WAIT", f"waiting at {self.plan.end_name} for a feasible order")
         else:
             self._set_state("GROUNDED_NEEDS_PICKUP", "emergency landing")
 

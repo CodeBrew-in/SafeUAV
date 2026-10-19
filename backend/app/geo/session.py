@@ -43,7 +43,6 @@ STAY_RE = re.compile(r"\b(?:don'?t|do not|never|no need to)\s+(?:return|go|come|
 DIVERT_RE = re.compile(r"\b(divert|detour|go first|first go|go now|right now|immediately|urgent)\b", re.I)
 YES_RE = re.compile(r"^\s*(yes|yeah|yep|yup|ok|okay|sure|correct|right|exactly|haan|ha|y)\W*$", re.I)
 ONLY_WORDS = re.compile(r"\b(only|instead)\b", re.I)
-HOLD_MAX_TICKS = 20      # the drone waits for the AI at most this many simulated seconds
 MAX_CHAT = 400
 MAX_TARGETS = 10
 AI_DEADLINE_S = {"gemini": 30.0, "ollama": 60.0}
@@ -228,7 +227,8 @@ class Session:
     def holding(self) -> bool:
         """The drone waits (hovers) while the AI reads a message."""
         return (bool(self.token) and self.started and self.cfg.wait_for_ai and self.cfg.mode != "direct"
-                and not self.safety_pending)
+                and not self.safety_pending
+                and self.ctl.energy > self.ctl.floor_wh() + 1.0)     # a low battery ends the hold: the drone must divert
 
     def say(self, who: str, text: str, **extra) -> None:
         with self.lock:
@@ -475,8 +475,8 @@ class Session:
             if pad is not None:
                 if kind != "land":
                     raise SessionError("Only a landing can name a pad.")
-                if pad not in self.campus.pads:
-                    raise SessionError("That is not a landing pad.")
+                if pad not in self.campus.pads and self.campus.find(pad) is None:
+                    raise SessionError("That is not a known place.")
                 plan, reason = self.ctl.land_plan(pad)
                 if plan is None:                  # refused here, so nothing changes and the drone flies on
                     raise SessionError(f"Can't land at {pad}: {reason}.")
@@ -532,7 +532,7 @@ class Session:
             if not self.started or self.paused:
                 return
             ctl = self.ctl
-            if self.holding and not self.safety_pending and self.hold_ticks < HOLD_MAX_TICKS:
+            if self.holding:
                 self.hold_ticks += 1          # hovering costs battery and time, so the numbers stay honest
                 if ctl.state in FLYING:
                     ctl._drain(HOVER_W, ctl.dt)
@@ -573,7 +573,7 @@ class Session:
         m = LAND_AT.match(text) if len(text) <= 70 else None
         land_raw = None
         if m:
-            place = self.campus.find(m.group(1))        # an exact name needs no AI
+            place = self._resolve_name(m.group(1))      # exact or close spelling: no AI call, no wait
             if place is not None:
                 with self.lock:
                     self.say("operator", text)
@@ -675,18 +675,14 @@ class Session:
         return dataclasses.replace(new, targets=tuple(added + [t for t in new.targets if _k(t) in old_keys]))
 
     def _land_at(self, place) -> None:
-        """Land at a named place: only an approved pad qualifies, and the shield still checks the route."""
+        """Land at a named place (a pad or any other named place). The shield checks the route and the landing spot
+        like every other route; a refusal says why (inside a no-fly zone, too far for the battery, ...)."""
         try:
-            if place.name in self.campus.pads:
-                if not self.started:
-                    self.say("ai", "Nothing is flying yet.", status="keyword")
-                else:
-                    self.emergency("land", place.name)
-                    self.say("ai", f"Landing at {place.name}.", status="keyword")
+            if not self.started:
+                self.say("ai", "Nothing is flying yet.", status="keyword")
             else:
-                pads = ", ".join(sorted(self.campus.pads))
-                self.say("system", f"{place.name} is not a landing pad, so the drone cannot land there. "
-                         f"Pads: {pads}. Say \"land now\" for the nearest pad, or \"land at <pad>\".", level="bad")
+                self.emergency("land", place.name)
+                self.say("ai", f"Landing at {place.name}.", status="keyword")
         except SessionError as e:
             self.say("system", f"Not applied: {e}", level="bad")
 

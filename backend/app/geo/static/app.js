@@ -391,7 +391,7 @@ function onMapClick(px, py, forced) {
     row.append(h('button', { class: 'warn small', disabled: ended || (!isA && (isBase || isT)), title: (!isA && (isBase || isT)) ? 'The base and the targets cannot be restricted' : '', onclick: () => edit(isA ? 'avoid_remove' : 'avoid_add', p.name) }, isA ? 'Allow again' : 'Restrict'));
     if (MAP.pads[p.name]) row.append(h('button', { class: 'small', disabled: S.phase !== 'DRAFT', title: S.phase !== 'DRAFT' ? 'The base can only change before Start' : '', onclick: () => config({ base_pad: p.name }) }, 'Set as base'));
     if (p.kind === 'area') row.append(h('button', { class: 'small', title: 'Delete this drawn area', onclick: () => edit('circle_remove', p.name) }, 'Delete area'));
-    if (MAP.pads[p.name]) row.append(h('button', { class: 'warn small', disabled: !['FLYING', 'PAUSED'].includes(S.phase), title: 'Fly here and land (checked by the shield)', onclick: () => { hideCard(); post('/api/emergency', { kind: 'land', pad: p.name }); } }, 'Land here'));
+    row.append(h('button', { class: 'warn small', disabled: !['FLYING', 'PAUSED'].includes(S.phase), title: 'Fly here and land (checked by the shield)', onclick: () => { hideCard(); post('/api/emergency', { kind: 'land', pad: p.name }); } }, 'Land here'));
     card.append(row);
   }
   card.classList.remove('hidden');

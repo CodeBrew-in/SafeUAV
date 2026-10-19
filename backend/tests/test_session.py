@@ -431,20 +431,25 @@ def test_a_stale_queued_edit_does_not_relaunch_a_landed_drone():
         s.emergency("return")
 
 
-def test_the_hold_costs_battery_and_is_capped():
+def _near(s, name, tol=6.0):
+    c = s.campus.find(name).center
+    return abs(s.ctl.pos[0] - c[0]) < tol and abs(s.ctl.pos[1] - c[1]) < tol
+
+
+def test_the_hold_costs_battery_and_lasts_while_the_ai_reads():
     gate = threading.Event()
     llm = FakeLLM(reply([LIB]), wait=gate)
     s = sess(llm)
     s.edit("target_add", LIB)
     s.start()
     run_ticks(s, 10)
-    e0, t0 = s.ctl.energy, s.ctl.t
+    e0, t0, pos0 = s.ctl.energy, s.ctl.t, tuple(s.ctl.pos)
     t = _chat_in_thread(s, "inspect the library")
     assert llm.started.wait(3)
     run_ticks(s, 5)
     assert s.ctl.energy < e0 and s.ctl.t == t0 + 5            # hovering is not free and the clock runs
     run_ticks(s, 60)
-    assert s.hold_ticks >= 20 and s.ctl.t > t0 + 20           # after the cap the flight goes on
+    assert s.holding and s.ctl.t == t0 + 65 and s.ctl.pos == pos0   # no cap: it never moves while the AI reads
     gate.set()
     t.join(5)
 
@@ -534,8 +539,8 @@ def test_land_at_a_pad_that_fails_the_shield_is_refused_and_the_drone_flies_on()
     run_ticks(s, 2)                                       # the restriction reaches the controller
     with pytest.raises(SessionError, match="inside"):
         s.emergency("land", blocked)
-    with pytest.raises(SessionError, match="not a landing pad"):
-        s.emergency("land", LIB)
+    with pytest.raises(SessionError, match="not a known place"):
+        s.emergency("land", "Nowhere Land")
     with pytest.raises(SessionError):
         s.emergency("return", "Fete Area")
 
@@ -641,17 +646,19 @@ def test_exact_land_at_a_non_pad_is_explained_without_the_ai():
     _fly(s)
     before = s.desired.targets
     s.handle("land and stop at neeram hall")
-    assert s.desired.targets == before and not s.safety_pending
-    assert any("not a landing pad" in c["text"] for c in s.chat if c["who"] == "system")
+    assert s.desired.targets == before and s.safety_pending              # it lands, at the place named
+    assert any("Landing at Neeram Hall" in c["text"] for c in s.chat if c["who"] == "ai")
+    run_ticks(s, 1500)
+    assert s.phase == "WAITING" and _near(s, "Neeram Hall")
 
 
 def test_the_ai_reads_a_misspelt_place_in_a_landing_order():
     s = sess(FakeLLM(reply(["Neeram Hall"])))
     _fly(s)
     before = s.desired.targets
-    s.handle("land at neeram haul")                       # the spelling is the AI's job
-    assert s.desired.targets == before and not s.safety_pending
-    assert any("Neeram Hall is not a landing pad" in c["text"] for c in s.chat if c["who"] == "system")
+    s.handle("land at xqzv hall")                         # nothing local matches, so the AI works out the place
+    assert s.desired.targets == before and s.safety_pending
+    assert any("Landing at Neeram Hall" in c["text"] for c in s.chat if c["who"] == "ai")
     s2 = sess(FakeLLM(reply(["Fete Area"])))
     _fly(s2)
     s2.handle("land at fate areea")
@@ -666,7 +673,7 @@ def test_offline_a_close_spelling_still_works_for_a_landing_order():
     before = s.desired.targets
     s.handle("land at neeram hamll")
     assert s.desired.targets == before
-    assert any("not a landing pad" in c["text"] for c in s.chat if c["who"] == "system")
+    assert any("Landing at Neeram Hall" in c["text"] for c in s.chat if c["who"] == "ai")
 
 
 @pytest.mark.parametrize("text", ["dont return home", "don't return to base", "do not go back home", "go to the library and stop there"])
@@ -819,4 +826,38 @@ def test_land_at_an_unclear_name_takes_the_place_the_ai_names_and_never_asks():
     s.handle("land at tan")
     texts = [c["text"] for c in s.chat if c["who"] != "operator"]
     assert not any(c.get("status") == "clarify" for c in s.chat)
-    assert any("not a landing pad" in t for t in texts) and s.desired.targets == before
+    assert any("Landing at Tan Complex" in t for t in texts) and s.desired.targets == before and s.safety_pending
+
+
+def test_a_close_spelling_in_a_landing_order_needs_no_ai_and_lands_at_the_nearest_pad():
+    class Boom:
+        def ask(self, *a, **k):
+            raise AssertionError("AI must not be called")
+    s = sess(Boom())
+    _fly(s)
+    s.handle("land at vahi hall")                          # "Vahni Hall" is not a pad: the drone lands right there
+    msg = [c["text"] for c in s.chat if c["who"] == "ai"][-1]
+    assert "Landing at Vahni Hall" in msg and s.safety_pending
+    run_ticks(s, 1500)
+    assert s.phase == "WAITING" and _near(s, "Vahni Hall")
+
+
+def test_the_drone_does_not_move_at_any_speed_while_the_ai_reads_and_a_low_battery_ends_the_hold():
+    gate = threading.Event()
+    llm = FakeLLM(reply([LIB]), wait=gate)
+    s = sess(llm)
+    s.edit("target_add", LIB)
+    s.start()
+    s.set_speed(5)
+    run_ticks(s, 5)
+    th = _chat_in_thread(s, "inspect the library")
+    assert llm.started.wait(3)
+    pos0, t0 = tuple(s.ctl.pos), s.ctl.t
+    run_ticks(s, 150)
+    assert s.holding and s.ctl.t == t0 + 150 and tuple(s.ctl.pos) == pos0        # 30 real seconds at 5x: still hovering
+    s.ctl.energy = s.ctl.floor_wh() + 0.5                                          # battery nearly at the reserve
+    assert not s.holding                                                           # the hold ends, the drone may divert
+    run_ticks(s, 20)
+    assert tuple(s.ctl.pos) != pos0 or s.ctl.state != "CRUISE"
+    gate.set()
+    th.join(5)
