@@ -56,7 +56,7 @@ class MissionSpec:
             return None if m is None else f"{m // 60:02d}:{m % 60:02d}"
         return {"targets": list(self.targets),
                 "avoid": [{"zone": r.zone, "from": hhmm(r.start_min), "to": hhmm(r.end_min)} for r in self.avoid],
-                "return_to_base": self.return_to_base}
+                "stay_at_end": not self.return_to_base}
 
 
 @dataclass
@@ -105,9 +105,15 @@ def spec_from_json(obj: object) -> MissionSpec:
         if not isinstance(a, dict) or not isinstance(a.get("zone"), str):
             raise ValueError(f"bad avoid rule {a!r}"[:200])
         rules.append(AvoidRule(a["zone"], parse_time(a.get("from")), parse_time(a.get("to"))))
-    rtb = obj.get("return_to_base", True)
-    if not isinstance(rtb, bool):
-        raise ValueError("'return_to_base' must be true or false")
+    if "stay_at_end" in obj:  # the LLM-facing field; defaulting to false is what small models do anyway
+        stay = obj["stay_at_end"]
+        if not isinstance(stay, bool):
+            raise ValueError("'stay_at_end' must be true or false")
+        rtb = not stay
+    else:
+        rtb = obj.get("return_to_base", True)
+        if not isinstance(rtb, bool):
+            raise ValueError("'return_to_base' must be true or false")
     if len(targets) > 10:
         raise ValueError("at most 10 targets")
     return MissionSpec(tuple(targets), tuple(rules), rtb)

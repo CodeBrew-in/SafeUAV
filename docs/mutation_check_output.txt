@@ -1,4 +1,4 @@
-Mutation check run 2026-10-18T18:07:52+00:00
+Mutation check run 2026-10-19T07:46:51+00:00
 
 CAUGHT   shield ignores restricted cells
 CAUGHT   shield ignores obstacles
@@ -15,5 +15,16 @@ CAUGHT   runner misses false infeasible
 CAUGHT   A* forgets return leg
 CAUGHT   A* budget off by one
 CAUGHT   traversable ignores restricted
+CAUGHT   geo shield ignores the jail
+CAUGHT   geo shield ignores the geofence
+CAUGHT   geo shield ignores avoid zones
+CAUGHT   geo preflight ignores energy
+CAUGHT   geo preflight drops wind margin
+CAUGHT   geo spec ignores refuse
+CAUGHT   geo validate allows targets in zones
+CAUGHT   geo controller applies invalid orders
+CAUGHT   geo controller keeps old route when impossible
+CAUGHT   geo runtime monitor disabled
+CAUGHT   geo landed wait unbounded
 
-15/15 planted bugs caught
+26/26 planted bugs caught

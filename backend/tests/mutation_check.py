@@ -32,6 +32,24 @@ MUTANTS = [
     ("A* budget off by one", "app/astar.py", "if steps > c.max_steps:", "if steps > c.max_steps + 1:"),
     ("traversable ignores restricted", "app/mission.py",
      "return cell in self.obstacles or cell in self.restricted", "return cell in self.obstacles"),
+    # campus map (geo) core
+    ("geo shield ignores the jail", "app/geo/flight.py",
+     "< buf + extra:\n                return f\"no-fly zone", "< -1:\n                return f\"no-fly zone"),
+    ("geo shield ignores the geofence", "app/geo/flight.py", 'return "geofence"', "pass"),
+    ("geo shield ignores avoid zones", "app/geo/flight.py",
+     "if mission:\n            for name, poly, buf in self.avoid_polys:",
+     "if False:\n            for name, poly, buf in self.avoid_polys:"),
+    ("geo preflight ignores energy", "app/geo/flight.py", "if e > budget:", "if False:"),
+    ("geo preflight drops wind margin", "app/geo/flight.py", "forecast.scaled(FORECAST_MARGIN)", "forecast"),
+    ("geo spec ignores refuse", "app/geo/spec.py", 'if obj.get("refuse") is True:', "if False:"),
+    ("geo validate allows targets in zones", "app/geo/spec.py",
+     'errors.append(f"target {t!r} cannot be inspected', 'warnings.append(f"target {t!r} cannot be inspected'),
+    ("geo controller applies invalid orders", "app/geo/controller.py", "if not check.ok:", "if False:"),
+    ("geo controller keeps old route when impossible", "app/geo/controller.py",
+     'self._go_to_pad("old route abandoned', 'self._log("x", "old route abandoned'),
+    ("geo runtime monitor disabled", "app/geo/controller.py",
+     "if self.energy - need >= self.floor_wh() * 0.5:", "if True:"),
+    ("geo landed wait unbounded", "app/geo/controller.py", "> MAX_WAIT_MIN * 60:", "> 1e12:"),
 ]
 
 

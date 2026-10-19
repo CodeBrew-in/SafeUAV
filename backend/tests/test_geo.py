@@ -304,3 +304,11 @@ def test_no_message_can_lift_permanent_rules():
 def test_return_on_the_ground_is_ignored():
     ctl = run(MissionSpec(("Central Jail Patiala",)), changes=[(0, Command("return", text="return now"))])
     assert any(a["kind"] == "ignored" for a in ctl.audit)
+
+
+def test_escape_never_ends_in_a_pocket_the_planner_cannot_leave():
+    # regression: the avoid zone appears while the drone grazes E Hostel; escape must lead somewhere plannable
+    new = MissionSpec(("Venture Lab", "Directorate"), (AvoidRule("E Hostel", None, 17 * 60),))
+    ctl = run_script(C, capacity_wh=40, forecast=CALM, actual=CALM, clock_min=600,
+                     initial=MissionSpec(("Venture Lab",)), changes=[(40, Command("order", new, "x"))])
+    assert ctl.state == "DONE" and ctl.visited == ["venturelab", "directorate"]

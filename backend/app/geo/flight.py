@@ -261,7 +261,7 @@ def escape_path(air: Airspace, pos: Point) -> list[Point] | None:
     if air.violation(pos) is None:
         return [pos]
     start_permanent = air.violation(pos, mission=False)
-    best = None
+    cands = []
     for k in range(72):
         ang = 2 * math.pi * k / 72
         ux, uy = math.cos(ang), math.sin(ang)
@@ -273,14 +273,21 @@ def escape_path(air: Airspace, pos: Point) -> list[Point] | None:
             if air.violation(p) is None:
                 if out_at is None:
                     out_at = s * 2.0
-                if s * 2.0 >= out_at + 10.0:
-                    found = (out_at, p)  # clear for the whole 10 m beyond the exit
+                if s * 2.0 >= out_at + 10.0 and air.violation(p, PLAN_MARGIN / 2) is None:
+                    found = (out_at, p)  # clear for 10 m beyond the exit, and not grazing the edge
                     break
             else:
                 out_at = None  # back inside (a courtyard): keep looking further out
-        if found and (best is None or found[0] < best[0]):
-            best = found
-    return None if best is None else [pos, best[1]]
+        if found:
+            cands.append(found)
+    if not cands:
+        return None
+    cands.sort()
+    planner = GridPlanner(air)
+    for _, p in cands:  # shortest exit from which the planner can continue (not a closed pocket)
+        if planner._nearest_free(p) is not None:
+            return [pos, p]
+    return [pos, cands[0][1]]
 
 
 def usable_pads(air: Airspace) -> dict[str, Point]:
