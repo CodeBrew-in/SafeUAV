@@ -18,11 +18,12 @@
 <main>
   <section id="mapwrap">
     <canvas id="map" tabindex="0" aria-label="Campus map"></canvas>
-    <div id="banner"><span id="banner-main">Add a target, then press Start</span><span id="banner-sub"></span></div>
-    <div id="toasts"></div>
-    <div id="reject" class="hidden"></div>
+    <div id="banner" aria-live="polite"><span id="banner-main">Add a target, then press Start</span><span id="banner-sub"></span></div>
+    <div id="toasts" aria-live="polite"></div>
+    <div id="reject" class="hidden" role="alert"></div>
     <div id="replan" class="hidden"></div>
-    <div id="stale" class="hidden"></div>
+    <div id="stale" class="hidden" role="alert"></div>
+    <div id="dlg" class="hidden"></div>
     <div id="card" class="hidden"></div>
     <div id="mapctl">
       <button id="zin" title="Zoom in">+</button>
@@ -31,8 +32,7 @@
       <button id="follow" title="Follow the drone" aria-pressed="false">Follow</button>
     </div>
     <div id="scalebar"><div id="scalebar-line"></div><span id="scalebar-txt"></span></div>
-    <div id="north">N</div>
-    <div id="directnote" class="hidden">AI-direct mode: no shield, no animation. The route the AI wrote is drawn in red.</div>
+        <div id="directnote" class="hidden">AI-direct mode: no shield, no animation. The route the AI wrote is drawn in red.</div>
     <div id="legend">
       <span><i class="sw nofly"></i>no-fly (permanent)</span>
       <span><i class="sw avoid"></i>restricted by you</span>
@@ -76,7 +76,7 @@
       <div id="chat"></div>
       <div id="thinking" class="hidden"></div>
       <div id="presets"></div>
-      <form id="chatform"><input id="chatin" placeholder="Type an order or a change…" autocomplete="off" maxlength="2000"><button class="primary">Send</button></form>
+      <form id="chatform"><input id="chatin" placeholder="Type an order or a change…" autocomplete="off" maxlength="2000"><button id="send" class="primary">Send</button></form>
     </div>
     <div id="tab-log" class="panel tab hidden">
       <div id="downloads" class="row"></div>

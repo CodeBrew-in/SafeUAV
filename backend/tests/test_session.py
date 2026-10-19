@@ -179,12 +179,12 @@ def test_a_new_order_after_the_mission_that_needs_too_much_battery_is_refused_on
     s.start()
     run_ticks(s, 600)
     assert s.phase == "DONE"
-    s.edit("target_add", "Thapar School of Liberal Art and Sciences")
-    s.edit("target_add", VL)
-    s.edit("target_add", HB)
-    run_ticks(s, 5)
-    assert s.ctl.state == "LANDED_WAIT"
-    assert any(c["who"] == "system" and c.get("level") == "bad" for c in s.chat)   # shield said why, drone stayed down
+    s.ctl.energy = 3.0                                            # nearly empty on the pad
+    with pytest.raises(SessionError, match="Wh"):
+        s.edit("target_add", DIR)                                 # refused on the spot, with the reason
+    assert s.phase == "DONE" and s.ctl.state == "DONE"            # still cleanly finished, nothing started
+    s.edit("avoid_add", VL)                                       # restrictions can still be set for the next leg
+    assert any(r.zone == VL for r in s.desired.avoid)
 
 
 def test_edits_refused_after_a_crash_or_pickup():
@@ -227,9 +227,9 @@ def test_drone_holds_while_the_ai_thinks_then_continues():
     th = threading.Thread(target=s.handle, args=("also the directorate",))
     th.start()
     assert llm.started.wait(2)
-    t = s.ctl.t
+    t, e = s.ctl.t, s.ctl.energy
     run_ticks(s, 10)
-    assert s.ctl.t == t and s.holding and s.snapshot()["busy"]
+    assert s.ctl.t == t + 10 and s.ctl.energy < e and s.holding and s.snapshot()["busy"]   # hovering, paying for it
     with pytest.raises(SessionError):
         s.start()
     gate.set()
@@ -365,5 +365,131 @@ def test_a_new_order_cancels_a_pending_end():
     run_ticks(s, 10)
     s.end_mission()
     assert s.end_after_land
+    with pytest.raises(SessionError, match="landing or returning"):
+        s.edit("target_add", LIB)                      # no order slips in while the drone is coming down
+    assert s.end_after_land
+    run_ticks(s, 400)
+    assert s.phase == "DONE"
+
+
+# --- review fixes: the emergency path, strict keywords, input hardening --------------------------------
+
+def _chat_in_thread(s, text):
+    t = threading.Thread(target=s.handle, args=(text,))
+    t.start()
+    return t
+
+
+def test_land_acts_while_the_ai_is_still_thinking_and_a_late_reply_cannot_relaunch():
+    gate = threading.Event()
+    llm = FakeLLM(reply([LIB, DIR]), wait=gate)
+    s = sess(llm)
     s.edit("target_add", LIB)
-    assert not s.end_after_land
+    s.start()
+    run_ticks(s, 10)
+    t = _chat_in_thread(s, "also inspect the directorate please")
+    assert llm.started.wait(3)
+    s.emergency("land")
+    run_ticks(s, 400)
+    assert s.ctl.state == "LANDED_WAIT"                         # it landed although the AI never answered
+    gate.set()
+    t.join(5)
+    run_ticks(s, 100)
+    assert s.ctl.state == "LANDED_WAIT" and DIR not in s.ctl.visited   # the late reply did not relaunch it
+    assert any("landing command" in c["text"] for c in s.chat if c["who"] == "system")
+
+
+def test_the_replan_rate_limit_never_delays_land():
+    s = sess()
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 5)
+    for _ in range(8):
+        s.edit("target_add", DIR)
+        run_ticks(s, 1)
+        s.edit("target_remove", DIR)
+        run_ticks(s, 1)
+    s.emergency("land")
+    run_ticks(s, 3)
+    assert s.ctl.state in ("TO_PAD", "LANDED_WAIT")    # acted at once; before the fix it kept cruising for ~50 s
+
+
+def test_a_stale_queued_edit_does_not_relaunch_a_landed_drone():
+    s = sess()
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 10)
+    s.pause()
+    s.edit("target_add", DIR)
+    s.emergency("land")
+    run_ticks(s, 400)
+    assert s.ctl.state == "LANDED_WAIT" and not s.resume_submit
+    assert s.phase == "WAITING"
+    with pytest.raises(SessionError):
+        s.pause()
+    with pytest.raises(SessionError, match="ground"):
+        s.emergency("return")
+
+
+def test_the_hold_costs_battery_and_is_capped():
+    gate = threading.Event()
+    llm = FakeLLM(reply([LIB]), wait=gate)
+    s = sess(llm)
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 10)
+    e0, t0 = s.ctl.energy, s.ctl.t
+    t = _chat_in_thread(s, "inspect the library")
+    assert llm.started.wait(3)
+    run_ticks(s, 5)
+    assert s.ctl.energy < e0 and s.ctl.t == t0 + 5            # hovering is not free and the clock runs
+    run_ticks(s, 60)
+    assert s.hold_ticks >= 20 and s.ctl.t > t0 + 20           # after the cap the flight goes on
+    gate.set()
+    t.join(5)
+
+
+@pytest.mark.parametrize("text", [
+    "Inspect H-Block and return to base", "Check the Directorate then go home", "do not land",
+    "don't abort the mission", "Avoid Directorate, don't land there", "go now to the Directorate",
+    "Finish the mission at Directorate", "cancel mission, fly to the Library instead"])
+def test_longer_orders_containing_safety_words_are_not_hijacked(text):
+    from app.geo.operator import strict_keyword
+    from app.geo.session import END_WORDS
+    assert strict_keyword(text) is None and not END_WORDS.match(text)
+
+
+@pytest.mark.parametrize("text,kind", [("land now", "land"), ("Return home.", "return"), ("RTB", "return"),
+                                         ("please land", "land"), ("abort", "land")])
+def test_whole_message_safety_words_still_work(text, kind):
+    from app.geo.operator import strict_keyword
+    assert strict_keyword(text) == kind
+
+
+def test_non_finite_and_non_boolean_settings_are_refused():
+    s = sess()
+    for bad in ({"wind_from": float("nan")}, {"wind_speed": float("inf")}, {"capacity": True},
+                {"monitor": "false"}, {"clock": "١٠:00"}, {"model": "gpt"}):
+        with pytest.raises(SessionError):
+            s.configure(**bad)
+    with pytest.raises(SessionError):
+        s.edit("stay", value="false")
+    with pytest.raises(SessionError):
+        s.set_speed(2.0)
+    with pytest.raises(SessionError):
+        s.set_speed(True)
+
+
+def test_chat_with_only_replaces_the_targets_in_the_basic_parser():
+    s = sess(mode="classic")
+    s.edit("target_add", LIB)
+    s.edit("target_add", DIR)
+    s.handle("inspect venture lab only")
+    assert s.desired.targets == (VL,)
+
+
+def test_a_chat_reply_keeps_restrictions_when_no_target_is_set():
+    s = sess(FakeLLM(reply([LIB], avoid=[DIR])))
+    s.edit("avoid_add", DIR)
+    s.handle("inspect the library")
+    assert s.desired.targets == (LIB,) and [r.zone for r in s.desired.avoid] == [DIR]

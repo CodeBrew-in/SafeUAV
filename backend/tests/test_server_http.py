@@ -166,3 +166,19 @@ def test_concurrent_polls_and_edits_do_not_break(srv):
     [t.start() for t in ts]
     [t.join(20) for t in ts]
     assert not errs
+
+
+def test_review_hardening_headers_nan_deep_json_and_strict_values(srv):
+    _, _, _, hdr = call(srv, "GET", "/", token=False)
+    assert "frame-ancestors 'none'" in hdr["Content-Security-Policy"] and hdr["X-Frame-Options"] == "DENY"
+    call(srv, "POST", "/api/reset", {})
+    for raw in (b'{"wind_from": NaN}', b'{"wind_speed": Infinity}', b"[" * 5000):
+        assert call(srv, "POST", "/api/config", raw=raw)[0] == 400
+    assert call(srv, "GET", "/api/state")[0] == 200             # still valid JSON afterwards
+    assert call(srv, "POST", "/api/config", raw=b'{"monitor": "false"}')[0] == 400
+    assert call(srv, "POST", "/api/speed", {"speed": 2.9})[0] == 400
+    assert call(srv, "POST", "/api/speed", {"speed": True})[0] == 400
+    assert call(srv, "POST", "/api/edit", {"op": "stay", "value": "false"})[0] == 400
+    assert call(srv, "POST", "/api/reset", raw=b"{}", clen="+5")[0] == 400
+    assert call(srv, "POST", "/api/reset", raw=b"{}", clen="1_0")[0] == 400
+    assert call(srv, "POST", "/api/config", {"model": "gpt"})[1]["error"].startswith("Model must be one of")

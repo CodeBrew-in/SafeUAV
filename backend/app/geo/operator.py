@@ -47,10 +47,28 @@ def keyword_command(text: str) -> Command | None:
     return None
 
 
+_STRICT = [
+    (re.compile(r"^(please\s+)?(return(\s+(now|home|to\s+base))?|come\s+back(\s+(now|home))?|go\s+(home|back)|rtb)\W*$", re.I), "return"),
+    (re.compile(r"^(please\s+)?(land(\s+(now|immediately|here))?|abort(\s+(now|mission))?)\W*$", re.I), "land"),
+]
+
+
+def strict_keyword(text: str) -> str | None:
+    """Whole-message safety commands only ("land now", "return home"). A longer order that merely
+    contains such words ("inspect X and return to base", "do not land") goes to the parser."""
+    t = text.strip()
+    if len(t) > 40:
+        return None
+    for pat, kind in _STRICT:
+        if pat.match(t):
+            return kind
+    return None
+
+
 def interpret(text: str, llm, campus: Campus, *, current: MissionSpec | None, visited: list[str],
-              hhmm: str, deadline_s: float = 20.0, seed: int = 0) -> Interpretation:
+              hhmm: str, deadline_s: float = 20.0, seed: int = 0, keywords: bool = True) -> Interpretation:
     text = text[:2000]
-    kw = keyword_command(text)
+    kw = keyword_command(text) if keywords else None
     if kw is not None:
         return Interpretation(kw, "keyword", f"'{kw.kind}' command (handled without the AI)")
     if current is None:

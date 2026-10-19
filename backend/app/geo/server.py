@@ -14,6 +14,8 @@ Security (this is a local tool, but any web page you visit can still send reques
 from __future__ import annotations
 
 import hmac
+import re
+import socket
 import json
 import logging
 import secrets
@@ -105,14 +107,17 @@ def make_handler(app: App):
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Content-Security-Policy",
-                             "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+                             "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+                             "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
             for k, v in (extra or {}).items():
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
 
         def _json(self, obj, code: int = 200, extra: dict | None = None) -> None:
-            self._send(code, json.dumps(obj, default=list).encode(), "application/json", extra)
+            self._send(code, json.dumps(obj, default=list, allow_nan=False).encode(), "application/json", extra)
 
         def _deny(self, code: int, msg: str) -> None:
             self._json({"error": msg}, code)
@@ -170,7 +175,7 @@ def make_handler(app: App):
             if path == "/api/health":
                 return self._json(app.health())
             if path == "/api/state":
-                q = parse_qs(url.query)
+                q = parse_qs(url.query, keep_blank_values=True)
                 since = {}
                 for k in ("epoch", "chat", "audit", "track", "route_rev"):
                     try:
@@ -190,20 +195,20 @@ def make_handler(app: App):
             if ctype != "application/json":
                 self._deny(415, "Content-Type must be application/json")
                 return None
-            try:
-                n = int(self.headers.get("Content-Length") or "")
-            except ValueError:
+            cl = self.headers.get("Content-Length") or ""
+            if not re.fullmatch(r"[0-9]{1,9}", cl):
                 self._deny(400, "bad Content-Length")
                 return None
-            if n < 0:
-                self._deny(400, "bad Content-Length")
-                return None
+            n = int(cl)
             if n > MAX_BODY:
                 self._deny(413, "request too large")
                 return None
+            def no_const(name):
+                raise ValueError(name)    # NaN / Infinity are not valid JSON
+
             try:
-                body = json.loads(self.rfile.read(n) or b"{}")
-            except (json.JSONDecodeError, UnicodeDecodeError):
+                body = json.loads(self.rfile.read(n) or b"{}", parse_constant=no_const)
+            except (ValueError, RecursionError):   # JSONDecodeError and UnicodeDecodeError are ValueErrors
                 self._deny(400, "bad json")
                 return None
             if not isinstance(body, dict):
@@ -221,7 +226,11 @@ def make_handler(app: App):
                 return
             s, path = app.session, self.path.split("?")[0]
             if path == "/api/chat":
-                if s.token:
+                from .operator import strict_keyword
+                from .session import END_WORDS
+                said = str(body.get("text", "")).strip()
+                safety = len(said) <= 60 and (strict_keyword(said) or END_WORDS.match(said))
+                if s.token and not safety:
                     return self._deny(409, "still working on the previous message")
                 text = str(body.get("text", ""))
 
@@ -246,16 +255,13 @@ def make_handler(app: App):
                 simple[path]()
                 return self._json({"ok": True})
             if path == "/api/speed":
-                try:
-                    s.set_speed(int(body.get("speed")))
-                except (TypeError, ValueError):
-                    return self._deny(400, "bad speed")
+                s.set_speed(body.get("speed"))
                 return self._json({"ok": True})
             if path == "/api/config":
                 try:
                     s.configure(**{k: body.get(k) for k in ("model", "mode", "capacity", "wind_speed", "wind_from",
                                                             "clock", "monitor", "base_pad", "wait_for_ai") if k in body})
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     return self._deny(400, "bad settings")
                 return self._json({"ok": True})
             if path == "/api/emergency":
@@ -269,22 +275,53 @@ def make_handler(app: App):
     return Handler
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = False     # on Windows SO_REUSEADDR lets another process share the port
+    request_queue_size = 128
+    MAX_CONNECTIONS = 128
+
+    def __init__(self, *a, **kw):
+        self.conns = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        super().__init__(*a, **kw)
+
+    def server_bind(self):
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+    def process_request(self, request, client_address):
+        if not self.conns.acquire(blocking=False):      # too many open connections: drop this one
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.conns.release()
+
+
 def make_server(app: App, port: int = 0) -> ThreadingHTTPServer:
-    srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(app))  # loopback only, never 0.0.0.0
-    srv.daemon_threads = True
+    srv = Server(("127.0.0.1", port), make_handler(app))  # loopback only, never 0.0.0.0
     app.port = srv.server_address[1]
     return srv
 
 
 def sim_loop(app: App, stop: threading.Event) -> None:
     """One simulated second per tick; `speed` only changes how long we wait between ticks."""
+    last = None
     while not stop.is_set():
         time.sleep(1.0 / app.session.speed)
         try:
             app.session.tick()
-        except Exception as e:  # keep the console alive, and say so on screen
+            last = None
+        except Exception as e:  # keep the console alive, and say so on screen (once per kind of error)
             log.exception("simulation tick failed")
-            app.session.say("system", f"Internal simulator error: {type(e).__name__}. Press Reset.", level="bad")
+            if type(e).__name__ != last:
+                app.session.say("system", f"Internal simulator error: {type(e).__name__}. Press Reset.", level="bad")
+            last = type(e).__name__
             time.sleep(1)
 
 

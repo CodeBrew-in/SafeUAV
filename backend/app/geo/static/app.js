@@ -19,18 +19,20 @@ function h(tag, attrs, ...kids) {
 async function api(path, body) {
   const opt = { headers: { 'X-Session-Token': TOKEN } };
   if (body !== undefined) { opt.method = 'POST'; opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
-  const r = await fetch(path, opt);
+  const ctl = new AbortController(); const to = setTimeout(() => ctl.abort(), 8000); opt.signal = ctl.signal;
+  let r;
+  try { r = await fetch(path, opt); } catch (e) { throw new Error(e.name === 'AbortError' ? 'The server did not answer in time.' : 'Cannot reach the server.'); } finally { clearTimeout(to); }
   let js = null; try { js = await r.json(); } catch (e) { /* not json */ }
-  if (!r.ok) throw new Error((js && js.error) || ('HTTP ' + r.status));
+  if (!r.ok) throw new Error(r.status === 403 ? 'Session expired: reload this page.' : ((js && js.error) || ('HTTP ' + r.status)));
   return js;
 }
 
 // ---------------------------------------------------------------- state
 let MAP = null, S = null;
 let chat = [], audit = [], trail = [], route = [], zones = [];
-let ghost = null, replanChip = null, rejects = 0, violations = 0, firstPoll = true;
+let ghost = null, rejects = 0, violations = 0, firstPoll = true;
 let since = { epoch: -1, chat: 0, audit: 0, track: 0, route_rev: -1, zones_sig: null };
-let lastOk = 0, busySince = 0;
+let lastOk = 0, busySince = 0, initialChat = true, logShown = -1;
 let userMoved = false, view = { cx: 0, cy: 0, scale: 1 }, follow = false, dirtyBase = true, hover = null, selected = null;
 const disp = { x: 0, y: 0, h: 0, init: false };
 let BASE = null, drawOrder = [], places = [], placeByName = {}, hatchNoFly = null, hatchAvoid = null, baseCanvas = null, baseKey = '';
@@ -101,7 +103,7 @@ new ResizeObserver(resize).observe(cv);
 
 // input: drag to pan, wheel to zoom, click to select
 let drag = null;
-cv.addEventListener('pointerdown', e => { cv.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy, moved: false }; });
+cv.addEventListener('pointerdown', e => { if (e.button !== 0) return; cv.setPointerCapture(e.pointerId); drag = { x: e.clientX, y: e.clientY, cx: view.cx, cy: view.cy, moved: false }; });
 cv.addEventListener('pointermove', e => {
   const r = cv.getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
   if (drag) {
@@ -113,13 +115,17 @@ cv.addEventListener('pointermove', e => {
     if (hv !== hover) { hover = hv; dirtyBase = true; cv.title = hv ? hv.name : ''; }
   }
 });
+const endDrag = () => { drag = null; cv.classList.remove('dragging'); };
+cv.addEventListener('pointercancel', endDrag);
+cv.addEventListener('lostpointercapture', endDrag);
 cv.addEventListener('pointerup', e => {
+  if (e.button !== 0) return endDrag();
   cv.classList.remove('dragging');
   const wasClick = drag && !drag.moved; drag = null;
   if (wasClick) { const r = cv.getBoundingClientRect(); onMapClick(e.clientX - r.left, e.clientY - r.top); }
 });
-cv.addEventListener('wheel', e => { e.preventDefault(); const r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
-cv.addEventListener('dblclick', e => { const r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, 1.8); });
+cv.addEventListener('wheel', e => { e.preventDefault(); if (!MAP) return; const r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0015))); }, { passive: false });
+cv.addEventListener('dblclick', e => { if (!MAP) return; const r = cv.getBoundingClientRect(); zoomAt(e.clientX - r.left, e.clientY - r.top, 1.8); });
 $('zin').onclick = () => zoomAt(W / 2, H / 2, 1.4);
 $('zout').onclick = () => zoomAt(W / 2, H / 2, 1 / 1.4);
 $('fit').onclick = () => { setFollow(false); userMoved = false; fitView(); };
@@ -127,7 +133,8 @@ $('follow').onclick = () => setFollow(!follow);
 function setFollow(v) { follow = v; $('follow').setAttribute('aria-pressed', String(v)); }
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') hideCard();
-  if (e.key === ' ' && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) { e.preventDefault(); $('pause').click(); }
+  const a = document.activeElement;
+  if (e.key === ' ' && S && !e.repeat && !e.ctrlKey && !e.metaKey && !e.altKey && (a === document.body || a === cv)) { e.preventDefault(); $('pause').click(); }
 });
 
 // ---------------------------------------------------------------- map data
@@ -321,36 +328,51 @@ function render(now) {
 // ---------------------------------------------------------------- map click card
 function hideCard() { $('card').classList.add('hidden'); selected = null; }
 function onMapClick(px, py) {
-  const p = placeAt(toWorld(px, py));
+  const wp = toWorld(px, py);
+  const pinHit = S && S.targets.find(t => Math.hypot(wp[0] - t.center[0], wp[1] - t.center[1]) < 14 / view.scale);
+  const p = (pinHit && placeByName[pinHit.name]) || placeAt(wp);
   if (!p) return hideCard();
   selected = p;
   const card = $('card'); card.replaceChildren();
   card.append(h('h4', {}, p.name), h('small', {}, p.nofly ? 'Permanent no-fly zone. It cannot be changed.' : (MAP.pads[p.name] ? 'Landing pad · ' + p.kind : p.kind)));
   if (!p.nofly && S) {
     const isT = S.desired.targets.includes(p.name), isA = S.desired.avoid.some(a => a.zone === p.name), ended = ['GROUNDED', 'CRASHED'].includes(S.phase);
-    const row = h('div', { class: 'row' });
+    const isBase = S.config.base_pad === p.name, row = h('div', { class: 'row' });
     row.append(h('button', { class: 'primary small', disabled: ended, onclick: () => edit(isT ? 'target_remove' : 'target_add', p.name) }, isT ? 'Remove target' : 'Make target'));
-    row.append(h('button', { class: 'warn small', disabled: ended, onclick: () => edit(isA ? 'avoid_remove' : 'avoid_add', p.name) }, isA ? 'Allow again' : 'Restrict'));
+    row.append(h('button', { class: 'warn small', disabled: ended || (!isA && (isBase || isT)), title: (!isA && (isBase || isT)) ? 'The base and the targets cannot be restricted' : '', onclick: () => edit(isA ? 'avoid_remove' : 'avoid_add', p.name) }, isA ? 'Allow again' : 'Restrict'));
     if (MAP.pads[p.name]) row.append(h('button', { class: 'small', disabled: S.phase !== 'DRAFT', title: S.phase !== 'DRAFT' ? 'The base can only change before Start' : '', onclick: () => config({ base_pad: p.name }) }, 'Set as base'));
     card.append(row);
   }
   card.classList.remove('hidden');
-  card.style.left = Math.min(W - 290, Math.max(8, px + 12)) + 'px'; card.style.top = Math.min(H - 150, Math.max(8, py + 12)) + 'px';
+  card.style.left = Math.min(W - 290, Math.max(8, px + 12)) + 'px'; card.style.top = Math.min(H - 190, Math.max(8, py + 12)) + 'px';
 }
-async function edit(op, place, value) { hideCard(); try { const r = await api('/api/edit', { op, place, value }); toast('EDIT', r.message, 'ok'); poll(); } catch (e) { showReject(e.message); } }
-async function config(kv) { hideCard(); try { await api('/api/config', kv); poll(); } catch (e) { showReject(e.message); } }
+async function edit(op, place, value) { hideCard(); try { const r = await api('/api/edit', { op, place, value }); toast('EDIT', r.message, 'ok'); poll(); } catch (e) { missionSig = ''; showReject(e.message, true); poll(); } }
+async function config(kv) {
+  hideCard();
+  for (const v of Object.values(kv)) if (typeof v === 'number' && !Number.isFinite(v)) { missionSig = ''; showReject('Enter a number.'); return poll(); }
+  try { await api('/api/config', kv); poll(); } catch (e) { missionSig = ''; showReject(e.message); poll(); }
+}
+// in-page confirmation (native confirm() is blocked in embedded browsers)
+function ask(text, okLabel) {
+  return new Promise(res => {
+    const dlg = $('dlg'), done = v => { dlg.classList.add('hidden'); res(v); };
+    dlg.replaceChildren(h('div', { class: 'box', role: 'alertdialog' }, h('p', {}, text),
+      h('div', { class: 'row' }, h('button', { class: 'primary', onclick: () => done(true) }, okLabel || 'OK'), h('button', { onclick: () => done(false) }, 'Cancel'))));
+    dlg.classList.remove('hidden');
+  });
+}
 
 // ---------------------------------------------------------------- feedback widgets
 function toast(title, text, kind) {
   const t = h('div', { class: 'toast ' + (kind || '') }, h('b', {}, title), text);
-  $('toasts').append(t); while ($('toasts').children.length > 4) $('toasts').firstChild.remove();
-  setTimeout(() => t.remove(), 4500);
+  $('toasts').append(t); while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
+  setTimeout(() => t.remove(), kind === 'bad' ? 9000 : 4500);
 }
 let rejectTimer = 0;
-function showReject(msg) {
-  rejects++;
+function showReject(msg, count) {
+  if (count) rejects++;
   const c = $('reject'); c.replaceChildren(h('button', { class: 'x', onclick: () => c.classList.add('hidden'), 'aria-label': 'Close' }, '×'),
-    h('h4', {}, '⛔ Not applied'), h('p', {}, msg), h('p', { class: 'hint' }, (S && ['FLYING', 'PAUSED'].includes(S.phase)) ? 'The drone did not change course.' : 'Nothing was changed.'));
+    h('h4', {}, '⛔ Not applied'), h('p', {}, msg), count ? h('p', { class: 'hint' }, 'Your current plan was not changed.') : null);
   c.classList.remove('hidden'); clearTimeout(rejectTimer); rejectTimer = setTimeout(() => c.classList.add('hidden'), 12000);
 }
 function showReplan(text) {
@@ -366,10 +388,10 @@ function auditToast(e, prevState) {
   if (e.kind === 'warning') return toast('NOTE', m, 'warn');
   if (e.kind === 'state') {
     const to = (m.split('->')[1] || '').trim().split(':')[0].trim(), why = (m.split(':').slice(1).join(':') || '').trim();
-    const map = { ESCAPE: ['ESCAPE', 'warn'], TO_PAD: ['LANDING ON A PAD', 'warn'], LANDED_WAIT: ['WAITING', 'warn'], DONE: ['MISSION COMPLETE', 'ok'],
+    const map = { ESCAPE: ['ESCAPE', 'warn'], TO_PAD: ['LANDING ON A PAD', 'warn'], LANDED_WAIT: ['ON THE GROUND', 'warn'], DONE: ['MISSION COMPLETE', 'ok'],
       EMERGENCY: ['EMERGENCY', 'bad'], GROUNDED_NEEDS_PICKUP: ['GROUNDED', 'bad'], CRASHED: ['CRASHED', 'bad'] };
     if (map[to]) return toast(map[to][0], why, map[to][1]);
-    if (to === 'CRUISE' && ['LANDED_WAIT', 'ESCAPE'].includes(e.state)) return toast('RESUMING', why, 'ok');
+    if (to === 'CRUISE' && /^(LANDED_WAIT|ESCAPE) ->/.test(m)) return toast('RESUMING', why, 'ok');
   }
 }
 
@@ -380,15 +402,17 @@ function specText(sp) {
   return `Targets: ${sp.targets.join(' → ') || '—'}${av.length ? ' · Restricted: ' + av.join(', ') : ''} · ${sp.stay_at_end ? 'stays at the last place' : 'returns to base'}`;
 }
 function updateControls() {
-  const ph = S.phase, flying = ph === 'FLYING' || ph === 'PAUSED', ended = ['GROUNDED', 'CRASHED'].includes(ph);
+  const ph = S.phase, flying = ph === 'FLYING' || ph === 'PAUSED', waiting = ph === 'WAITING', ended = ['GROUNDED', 'CRASHED'].includes(ph);
   $('phase').textContent = ph; $('phase').className = 'badge ' + ph;
   const noTarget = !S.desired.targets.length;
   $('start').disabled = ph !== 'DRAFT' || S.busy || noTarget;
   $('start').title = ph !== 'DRAFT' ? 'Already started' : S.busy ? 'The AI is still reading your message' : noTarget ? 'Add a target first' : 'Start the flight';
   $('pause').textContent = ph === 'PAUSED' ? 'Resume' : 'Pause'; $('pause').disabled = !flying;
+  $('rtb').title = waiting ? 'The drone is already on the ground' : 'Fly back to base (works without the AI)';
   $('reset').disabled = false;
   $('rtb').disabled = !flying; $('land').disabled = !flying;
-  $('endm').disabled = !flying && !(ph === 'FLYING');
+  $('endm').disabled = !flying && !waiting;
+  $('send').disabled = !!S.busy;
   [...$('speeds').children].forEach(b => b.classList.toggle('on', +b.dataset.s === S.speed));
   $('batt').style.width = Math.max(0, S.battery_pct) + '%'; $('batt').style.background = S.battery_pct < 20 ? '#b91c1c' : '#15a05a';
   $('battv').textContent = S.battery_wh.toFixed(1) + ' Wh';
@@ -397,21 +421,22 @@ function updateControls() {
   const rest = remainLen(route, S.route_index, S.pos), eta = rest / CRUISE_MPS, nxt = S.targets.find(t => !t.done);
   let main = '', sub = '', kind = '';
   const lastWhy = (() => { for (let i = audit.length - 1; i >= 0; i--) if (audit[i].kind === 'state') return (audit[i].msg.split(':').slice(1).join(':') || '').trim(); return ''; })();
-  if (S.busy) { main = 'Understanding your message… ' + Math.round((performance.now() - busySince) / 1000) + ' s'; sub = S.holding ? 'The drone holds position while the AI reads it' : 'The drone keeps its current mission'; }
-  else if (ph === 'DRAFT') { main = 'Draft mission'; sub = noTarget ? 'Click a building to add a target, or type an order in Chat' : 'Check the plan, then press Start'; }
+  if (ph === 'DRAFT') { main = S.busy ? 'Understanding your message… ' + Math.round((performance.now() - busySince) / 1000) + ' s' : 'Draft mission'; sub = S.busy ? 'Nothing flies until you press Start' : noTarget ? 'Click a building to add a target, or type an order in Chat' : 'Check the plan, then press Start'; }
+  else if (ph === 'WAITING') { main = 'On the ground, waiting'; sub = S.busy ? 'Understanding your message…' : 'Send a new order (click or chat) to fly again. Idle battery use only.'; kind = 'warn'; }
   else if (ph === 'PAUSED') { main = 'Paused'; sub = 'Simulation clock paused (battery use is paused too)'; kind = 'warn'; }
   else if (ph === 'DONE') { main = 'Mission complete'; sub = 'Landed and waiting. Send a new order to fly again, or press Reset.'; kind = 'ok'; }
   else if (ph === 'GROUNDED' || ph === 'CRASHED') { main = ph === 'CRASHED' ? 'Crashed' : 'Grounded: pick-up needed'; sub = lastWhy; kind = 'bad'; }
   else switch (S.state) {
-    case 'CRUISE': main = nxt ? 'Flying to ' + nxt.name : 'Returning to base'; sub = 'ETA ≈ ' + mmss(eta) + ' · ' + Math.round(rest) + ' m to go'; break;
+    case 'CRUISE': main = nxt ? 'Flying to ' + nxt.name : 'Returning to base'; sub = 'ETA ≈ ' + mmss(eta) + ' sim-time · ' + Math.round(rest) + ' m of route left'; break;
     case 'ESCAPE': main = 'Leaving a restricted zone'; sub = lastWhy || 'Taking the nearest exit'; kind = 'warn'; break;
     case 'TO_PAD': main = 'Landing on a pad to wait'; sub = lastWhy || 'The old route was dropped'; kind = 'warn'; break;
     case 'LANDED_WAIT': main = 'Waiting on the pad'; sub = 'Send a new order to resume. Idle battery use only.'; kind = 'warn'; break;
     case 'EMERGENCY': main = 'Emergency landing'; sub = lastWhy; kind = 'bad'; break;
     default: main = S.state; sub = lastWhy;
   }
+  if (S.busy && ['FLYING', 'PAUSED'].includes(ph)) sub = (S.holding ? 'Holding while the AI reads your message · ' : 'AI reading your message · ') + sub;
   bn.textContent = main; bs.textContent = sub; cls.className = kind;
-  $('shield').replaceChildren('Shield: ', h('b', { class: rejects ? 'warn' : '' }, String(rejects)), ' blocked · no-fly violations: ', h('b', { class: violations ? 'bad' : 'ok' }, String(violations)));
+  $('shield').replaceChildren('Shield: ', h('b', { class: rejects ? 'warn' : '' }, String(rejects)), ' blocked · no-fly entries seen (estimate): ', h('b', { class: violations ? 'bad' : 'ok' }, String(violations)));
   $('directnote').classList.toggle('hidden', S.config.mode !== 'direct');
 }
 
@@ -427,7 +452,7 @@ function renderMission() {
     h('h3', {}, 'Targets (in order)'));
   if (!S.desired.targets.length) root.append(h('div', { class: 'hint' }, 'Click a building on the map, or type an order in Chat.'));
   S.targets.forEach((t, i) => root.append(h('div', { class: 'item' }, h('span', { class: 'n' + (t.done ? ' done' : '') }, t.done ? '✓' : i + 1), t.name,
-    h('button', { class: 'x small', disabled: ended, onclick: () => edit('target_remove', t.name), title: 'Remove' }, '✕'))));
+    h('button', { class: 'x small', disabled: ended || S.phase === 'DONE', onclick: () => edit('target_remove', t.name), title: 'Remove' }, '✕'))));
   root.append(h('h3', {}, 'Restricted areas'));
   if (!S.desired.avoid.length) root.append(h('div', { class: 'hint' }, 'None. Click a building and choose Restrict, or say “stay away from …”.'));
   S.desired.avoid.forEach(a => root.append(h('div', { class: 'item' }, h('span', { class: 'n avoid' }, '!'), a.zone + (a.from || a.to ? ` (${a.from || 'now'}–${a.to || '∞'})` : ''),
@@ -437,7 +462,7 @@ function renderMission() {
   root.append(h('h3', {}, 'Settings'));
   if (locked) root.append(h('div', { class: 'locked' }, '🔒 Locked after Start. Press Reset to change.'));
   const fld = (id, label, el) => h('label', { class: 'f' }, label, el);
-  const num = (id, key, min, max, step) => h('input', { id, type: 'number', min, max, step, value: c[key], disabled: locked, onchange: e => config({ [key]: +e.target.value }) });
+  const num = (id, key, min, max, step) => h('input', { id, type: 'number', min, max, step, value: c[key], disabled: locked, onchange: e => config({ [key]: e.target.value.trim() === '' ? NaN : +e.target.value }) });
   const sel = (id, key, opts) => h('select', { id, disabled: locked, onchange: e => config({ [key]: e.target.value }) }, opts.map(o => h('option', { value: o[0], selected: String(c[key]) === String(o[0]) }, o[1])));
   root.append(h('div', { class: 'grid2' },
     fld('f-cap', 'Battery (Wh)', num('f-cap', 'capacity', 5, 80, 1)),
@@ -446,9 +471,10 @@ function renderMission() {
     fld('f-wdir', 'Wind from', sel('f-wdir', 'wind_from', [[0, 'North'], [90, 'East'], [180, 'South'], [270, 'West']])),
     fld('f-model', 'AI model', sel('f-model', 'model', MAP.models.map(m => [m, m]))),
     fld('f-mode', 'Mode', sel('f-mode', 'mode', [['ours', 'Ours: AI → shield'], ['classic', 'Classic: no AI'], ['direct', 'AI-direct: no shield']]))));
-  root.append(h('div', { class: 'row' }, h('label', {}, h('input', { type: 'checkbox', id: 'f-wait', checked: c.wait_for_ai, onchange: e => config({ wait_for_ai: e.target.checked }) }), ' Hold the drone while the AI reads my message')),
+  root.append(h('div', { class: 'row' }, h('label', {}, h('input', { type: 'checkbox', id: 'f-wait', checked: c.wait_for_ai, disabled: locked, onchange: e => config({ wait_for_ai: e.target.checked }) }), ' Hold the drone while the AI reads my message')),
     h('div', { class: 'row' }, h('label', {}, h('input', { type: 'checkbox', id: 'f-mon', checked: c.monitor, disabled: locked, onchange: e => config({ monitor: e.target.checked }) }), ' Runtime battery monitor')));
   if (active) { const el = $(active); if (el && el.focus) el.focus(); }
+  root.scrollTop = 0;
 }
 
 function renderChat() {
@@ -456,14 +482,17 @@ function renderChat() {
   for (const m of chat) {
     const meta = [m.who, m.clock, m.status, m.latency_ms ? (m.latency_ms / 1000).toFixed(1) + ' s' : ''].filter(Boolean).join(' · ');
     box.append(h('div', { class: 'msg ' + m.who + (m.level ? ' ' + m.level : '') }, h('small', {}, meta), m.text, m.spec ? h('div', { class: 'spec' }, specText(m.spec)) : null));
-    if ((m.who === 'system' && m.level === 'bad') || (m.who === 'ai' && m.status === 'refused')) showReject(m.text);
+    if (!initialChat && ((m.who === 'system' && m.level === 'bad') || (m.who === 'ai' && m.status === 'refused'))) showReject(m.text, true);
   }
+  initialChat = false;
+  while (box.children.length > 300) box.firstChild.remove();
   chat = []; box.scrollTop = box.scrollHeight;
   const th = $('thinking');
   th.classList.toggle('hidden', !S.busy);
   if (S.busy) th.textContent = 'Understanding your message… ' + Math.round((performance.now() - busySince) / 1000) + ' s';
 }
 function renderLog() {
+  if (logShown === audit.length) return; logShown = audit.length;
   const el = $('log'); el.replaceChildren(...audit.slice(-200).reverse().map(e => h('div', {}, `${e.clock} [${e.state}] ${e.kind}: ${e.msg}`)));
 }
 
@@ -476,7 +505,7 @@ async function doPoll() {
     if (since.zones_sig != null) q.set('zones_sig', since.zones_sig);
     const d = await api('/api/state?' + q);
     lastOk = performance.now();
-    if (d.reset) { chat = []; audit = []; trail = []; route = []; zones = []; ghost = null; rejects = 0; violations = 0; disp.init = false; $('chat').replaceChildren(); missionSig = ''; hideCard(); $('reject').classList.add('hidden'); }
+    if (d.reset) { chat = []; audit = []; trail = []; route = []; zones = []; ghost = null; rejects = 0; violations = 0; disp.init = false; $('chat').replaceChildren(); missionSig = ''; hideCard(); $('reject').classList.add('hidden'); $('replan').classList.add('hidden'); $('toasts').replaceChildren(); initialChat = true; }
     if (d.busy && !(S && S.busy)) busySince = performance.now();
     const newAudit = d.audit;
     chat.push(...d.chat); audit.push(...d.audit);
@@ -491,20 +520,22 @@ async function doPoll() {
       }
       route = d.route;
     }
-    if (d.zones !== undefined) { zones = d.zones; dirtyBase = true; }
+    if (d.zones !== undefined) { if (JSON.stringify(zones) !== JSON.stringify(d.zones)) dirtyBase = true; zones = d.zones; }
+    if (trail.length > 6000) trail = trail.slice(-4000);
+    if (audit.length > 800) audit = audit.slice(-500);
     since = { epoch: d.epoch, chat: d.chat_total, audit: d.audit_total, track: d.track_total, route_rev: d.route_rev, zones_sig: d.zones_sig };
     if (!firstPoll) newAudit.forEach(e => auditToast(e)); firstPoll = false;
     if (!disp.init) { disp.x = d.pos[0]; disp.y = d.pos[1]; disp.init = true; }
     $('stale').classList.add('hidden');
     updateControls(); renderMission(); renderChat(); if (!$('tab-log').classList.contains('hidden')) renderLog();
   } catch (e) {
-    $('stale').textContent = 'Connection lost: view frozen. ' + e.message; $('stale').classList.remove('hidden');
+    $('stale').textContent = (e instanceof TypeError ? 'Display error: ' : 'Connection lost: view frozen. ') + e.message; $('stale').classList.remove('hidden');
   }
 }
 async function pollLoop() { await poll(); setTimeout(pollLoop, 250); }
 
 // ---------------------------------------------------------------- animation loop
-let lastT = performance.now();
+let lastT = performance.now(), lastBase = 0;
 function frame(now) {
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
   if (S && disp.init) {
@@ -514,8 +545,8 @@ function frame(now) {
       const k = 1 - Math.exp(-dt / 0.2); disp.x += dx * k; disp.y += dy * k;
       if (d > 0.4) { let a = Math.atan2(dy, dx), da = a - disp.h; da = Math.atan2(Math.sin(da), Math.cos(da)); disp.h += da * Math.min(1, dt * 8); }
     }
-    if (follow) { view.cx += (disp.x - view.cx) * Math.min(1, dt * 4); view.cy += (disp.y - view.cy) * Math.min(1, dt * 4); dirtyBase = true; }
-    if (S.busy) { const t = Math.round((performance.now() - busySince) / 1000); $('banner-main').textContent = 'Understanding your message… ' + t + ' s'; $('thinking').textContent = 'Understanding your message… ' + t + ' s'; }
+    if (follow) { view.cx += (disp.x - view.cx) * Math.min(1, dt * 4); view.cy += (disp.y - view.cy) * Math.min(1, dt * 4); clampView(); if (now - lastBase > 100) { dirtyBase = true; lastBase = now; } }
+    if (S.busy) { const t = Math.round((performance.now() - busySince) / 1000); $('thinking').textContent = 'Understanding your message… ' + t + ' s'; }
   }
   render(now); requestAnimationFrame(frame);
 }
@@ -524,13 +555,13 @@ function frame(now) {
 function post(path, body) { return api(path, body || {}).then(() => poll()).catch(e => showReject(e.message)); }
 async function init() {
   loadMap(await api('/api/map'), await api('/api/basemap'));
-  [1, 2, 5].forEach(s => $('speeds').append(h('button', { 'data-s': s, onclick: () => post('/api/speed', { speed: s }) }, s + '×')));
+  (MAP.speeds || [1, 2, 5]).forEach(s => $('speeds').append(h('button', { 'data-s': s, onclick: () => post('/api/speed', { speed: s }) }, s + '×')));
   $('start').onclick = () => post('/api/start');
   $('pause').onclick = () => { if (!$('pause').disabled) post(S.phase === 'PAUSED' ? '/api/resume' : '/api/pause'); };
-  $('reset').onclick = () => { if (S && ['FLYING', 'PAUSED'].includes(S.phase) && !confirm('Reset stops the flight and clears the log. Continue?')) return; post('/api/reset'); };
+  $('reset').onclick = async () => { if (S && S.phase !== 'DRAFT' && !(await ask('Reset ends this flight and clears the chat and log. Download anything you need first.', 'Reset'))) return; post('/api/reset'); };
   $('rtb').onclick = () => post('/api/emergency', { kind: 'return' });
   $('land').onclick = () => post('/api/emergency', { kind: 'land' });
-  $('endm').onclick = () => { if (confirm('End this mission? The drone lands, then waits for a new order.')) post('/api/end'); };
+  $('endm').onclick = async () => { if (await ask('End this mission? The drone lands on the nearest pad, then waits for a new order.', 'End mission')) post('/api/end'); };
   document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
     document.querySelectorAll('#tabs button').forEach(x => x.classList.toggle('on', x === b));
     for (const t of ['mission', 'chat', 'log']) $('tab-' + t).classList.toggle('hidden', t !== b.dataset.tab);

@@ -150,15 +150,18 @@ class Controller:
             self.inbox.clear()
             return
         # rate limit: at most MAX_REPLANS_PER_MIN applied per minute; the rest wait (coalesced)
+        # land/return are never rate-limited: the operator can always bring the drone down
+        urgent = any(c.kind in ("land", "return") for c in self.inbox)
         self.replan_times = [x for x in self.replan_times if self.t - x < 60]
-        if len(self.replan_times) >= MAX_REPLANS_PER_MIN:
+        if not urgent and len(self.replan_times) >= MAX_REPLANS_PER_MIN:
             return
         cmds, self.inbox = self.inbox, []
         # coalesce: RETURN/LAND win over orders; otherwise only the latest order matters
         cmd = next((c for c in reversed(cmds) if c.kind in ("land", "return")), cmds[-1])
         if len(cmds) > 1:
             self._log("coalesced", f"{len(cmds)} queued commands -> applying the latest '{cmd.kind}'")
-        self.replan_times.append(self.t)
+        if not urgent:
+            self.replan_times.append(self.t)
         if cmd.kind in ("return", "land") and self.state not in FLYING:
             self._log("ignored", f"'{cmd.kind}' ignored: the drone is already on the ground")
             return
