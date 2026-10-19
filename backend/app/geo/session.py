@@ -40,6 +40,7 @@ END_WORDS = re.compile(r"^\s*(please\s+)?(end|finish|stop|cancel)\s+(the\s+|this
 LAND_AT = re.compile(r"^\s*(?:please\s+)?land\s+(?:and\s+(?:stop|stay|wait)\s+)?(?:at|on|in)\s+(?:the\s+)?(.+?)\W*$", re.I)
 STAY_RE = re.compile(r"\b(?:don'?t|do not|never|no need to)\s+(?:return|go|come|fly)\s+(?:back|home|to\s+base)(?:\s+to\s+base)?\b"
                      r"|\b(?:stop|stay|remain|finish|end|wait)\s+(?:at|there|here)\b|\bland\s+and\s+(?:stop|stay)\b", re.I)
+DIVERT_RE = re.compile(r"\b(divert|detour|go first|first go|go now|right now|immediately|urgent)\b", re.I)
 ONLY_WORDS = re.compile(r"\b(only|instead)\b", re.I)
 HOLD_MAX_TICKS = 20      # the drone waits for the AI at most this many simulated seconds
 MAX_CHAT = 400
@@ -482,6 +483,11 @@ class Session:
             self.gen += 1                    # answers to messages sent before this command are dropped
             self.ctl.submit(Command(kind, None, f"operator: {kind} now" + (f" at {pad}" if pad else ""), pad))
 
+    def _drop_pending(self) -> None:
+        """Ending a mission drops the targets not reached; the reached ones stay for the record."""
+        done = tuple(t for t in self.desired.targets if _k(t) in self.ctl.visited)
+        self.desired = dataclasses.replace(self.desired, targets=done)
+
     def end_mission(self) -> None:
         """The operator ends the mission: land on the nearest pad if airborne, then finish (DONE).
         A finished drone stays on the ground and accepts a new order. Works without the AI."""
@@ -501,6 +507,7 @@ class Session:
                 self.resume_submit = False
                 self.gen += 1                # an AI reply still on its way must not start a new leg
                 self.ctl._set_state("DONE", "mission ended by the operator")
+                self._drop_pending()
             elif st == "DONE":
                 raise SessionError("The mission is already complete.")
             else:
@@ -539,6 +546,7 @@ class Session:
             if self.end_after_land:
                 if ctl.state == "LANDED_WAIT":
                     ctl._set_state("DONE", "mission ended by the operator")
+                    self._drop_pending()
                     self.end_after_land = False
                 elif ctl.state in ("DONE", "GROUNDED_NEEDS_PICKUP", "CRASHED"):
                     self.end_after_land = False
@@ -559,25 +567,15 @@ class Session:
                     self.say("system", f"Not applied: {e}", level="bad")
             return
         m = LAND_AT.match(text) if len(text) <= 70 else None
+        land_raw = None
         if m:
-            place = self._resolve_name(m.group(1))
-            if place is not None:                 # a known place: this is a landing order, never a target
+            place = self.campus.find(m.group(1))        # an exact name needs no AI
+            if place is not None:
                 with self.lock:
                     self.say("operator", text)
-                    try:
-                        if place.name in self.campus.pads:
-                            if not self.started:
-                                self.say("ai", "Nothing is flying yet.", status="keyword")
-                            else:
-                                self.emergency("land", place.name)
-                                self.say("ai", f"Landing at {place.name} (handled without the AI)", status="keyword")
-                        else:
-                            pads = ", ".join(sorted(self.campus.pads))
-                            self.say("system", f"{place.name} is not a landing pad, so the drone cannot land there. "
-                                     f"Pads: {pads}. Say \"land now\" for the nearest pad, or \"land at <pad>\".", level="bad")
-                    except SessionError as e:
-                        self.say("system", f"Not applied: {e}", level="bad")
+                    self._land_at(place)
                 return
+            land_raw = m.group(1)                       # otherwise the AI reads the (maybe misspelt) place name below
         kind = strict_keyword(text)
         if kind is not None:
             with self.lock:
@@ -608,13 +606,19 @@ class Session:
             if cfg.mode == "direct":
                 self._direct(text, hh, gen)
                 return
-            interp = self._interpret(text, base, visited, hh, cfg, campus)
+            if land_raw:      # "land at <place>": the AI only has to find which place is meant
+                interp = self._interpret(f"inspect {land_raw}", MissionSpec(()), [], hh, cfg, campus)
+            else:
+                interp = self._interpret(text, base, visited, hh, cfg, campus)
             with self.lock:
                 if gen != self.gen:
                     if self.epoch == epoch0:
                         self.say("system", "Not applied: you gave a landing command while the AI was reading this.", level="bad")
                     return                      # reset or Land/Return/End happened while the AI was thinking
-                self._apply_interp(interp, text, base)
+                if land_raw:
+                    self._apply_land(interp, land_raw)
+                else:
+                    self._apply_interp(interp, text, base)
         finally:
             with self.lock:
                 if self.token == token:
@@ -630,6 +634,51 @@ class Session:
                       hhmm=hh, deadline_s=deadline, keywords=False)
         return ("ai", r)
 
+    @staticmethod
+    def _prioritize(new: MissionSpec, old: MissionSpec, text: str) -> MissionSpec:
+        """"Divert to X" / "go to X now": the new stops come first, the rest of the mission follows."""
+        if not DIVERT_RE.search(text):
+            return new
+        old_keys = {_k(t) for t in old.targets}
+        added = [t for t in new.targets if _k(t) not in old_keys]
+        if not added:
+            return new
+        return dataclasses.replace(new, targets=tuple(added + [t for t in new.targets if _k(t) in old_keys]))
+
+    def _land_at(self, place) -> None:
+        """Land at a named place: only an approved pad qualifies, and the shield still checks the route."""
+        try:
+            if place.name in self.campus.pads:
+                if not self.started:
+                    self.say("ai", "Nothing is flying yet.", status="keyword")
+                else:
+                    self.emergency("land", place.name)
+                    self.say("ai", f"Landing at {place.name}.", status="keyword")
+            else:
+                pads = ", ".join(sorted(self.campus.pads))
+                self.say("system", f"{place.name} is not a landing pad, so the drone cannot land there. "
+                         f"Pads: {pads}. Say \"land now\" for the nearest pad, or \"land at <pad>\".", level="bad")
+        except SessionError as e:
+            self.say("system", f"Not applied: {e}", level="bad")
+
+    def _apply_land(self, interp, land_raw: str) -> None:
+        """Which place did 'land at <land_raw>' mean? The AI reads the spelling; offline, a close-spelling match."""
+        kind, r = interp
+        names: list[str] = []
+        if kind == "ai" and r.status == "applied":
+            names = list(r.command.spec.targets)
+        elif kind == "ai" and r.status in ("refused", "clarify"):
+            self.say("ai", r.message, status=r.status)
+            return
+        else:
+            place = self._resolve_name(land_raw)
+            names = [place.name] if place else RegexParser(self.campus).parse_parts(f"inspect {land_raw}")[0]
+        place = self.campus.find(names[0]) if names else None
+        if place is None:
+            self.say("system", f"I couldn't tell which place \"{land_raw}\" is. Click a pad on the map and press Land here.", level="bad")
+            return
+        self._land_at(place)
+
     def _apply_interp(self, interp, text: str, base: MissionSpec) -> None:
         kind, r = interp
         try:
@@ -642,6 +691,7 @@ class Session:
                 return
             if kind == "ai" and r.status in ("applied",):
                 new = merge_reply(base, r.command.spec, self.working_spec())
+                new = self._prioritize(new, base, text)
                 self._commit(new, source="chat", text=text)
                 self.say("ai", "Understood.", status="applied", spec=new.to_json(),
                          latency_ms=None if r.latency_ms is None else round(r.latency_ms))
@@ -663,7 +713,7 @@ class Session:
             cur = self.working_spec()
             if targets and ONLY_WORDS.search(text):
                 cur = dataclasses.replace(cur, targets=())     # "only" / "instead": replace, don't append
-            new = apply_parts(cur, targets, avoid, stay)
+            new = self._prioritize(apply_parts(cur, targets, avoid, stay), cur, text)
             self._commit(new, source="chat", text=text)
             self.say("ai", ("AI unavailable: basic parser used. " if fallback else "Basic parser: ") + "Understood.",
                      status="fallback" if fallback else "applied", spec=new.to_json())

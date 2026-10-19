@@ -151,6 +151,7 @@ $('follow').onclick = () => setFollow(!follow);
 function setDraw(v) { drawMode = v; circlePrev = null; $('draw').setAttribute('aria-pressed', String(v)); cv.style.cursor = v ? 'crosshair' : ''; if (v) toast('DRAW AN AREA', 'Press on the map and drag outward to set the radius (20 to 300 m).'); }
 $('draw').onclick = () => setDraw(!drawMode);
 function setFollow(v) { follow = v; $('follow').setAttribute('aria-pressed', String(v)); }
+document.addEventListener('click', e => { const b = e.target.closest && e.target.closest('#controls button, #mapctl button'); if (b) b.blur(); });  // so Space keeps pausing
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { hideCard(); const d = $('dlg'); if (!d.classList.contains('hidden')) d.querySelectorAll('button')[1].click(); }
   const a = document.activeElement;
@@ -193,7 +194,15 @@ function placeAt(w) {
   for (const z of MAP.no_fly) if (pip(w, z.poly)) return { name: z.name, kind: 'no-fly', nofly: true };
   for (const [n, c] of Object.entries(MAP.pads)) if (Math.hypot(w[0] - c[0], w[1] - c[1]) < 14 / view.scale) return placeByName[n] || { name: n, kind: 'pad' };
   for (const p of places) if (!p.region && pip(w, p.poly)) return p;
-  return null;
+  // thin or ragged footprints are easy to miss: accept a click within ~10 px of a named building
+  const tol = 10 / view.scale; let best = null, bd = tol;
+  for (const p of places) {
+    if (p.region) continue;
+    if (!p.bb) { const xs = p.poly.map(q => q[0]), ys = p.poly.map(q => q[1]); p.bb = [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]; }
+    if (w[0] < p.bb[0] - tol || w[0] > p.bb[2] + tol || w[1] < p.bb[1] - tol || w[1] > p.bb[3] + tol) continue;
+    const d = distPoly(w, p.poly); if (d < bd) { bd = d; best = p; }
+  }
+  return best;
 }
 
 // ---------------------------------------------------------------- drawing: static layer (cached)
@@ -404,7 +413,7 @@ function ask(text, okLabel) {
 function toast(title, text, kind) {
   const t = h('div', { class: 'toast ' + (kind || '') }, h('b', {}, title), text);
   $('toasts').append(t); while ($('toasts').children.length > 3) $('toasts').firstChild.remove();
-  setTimeout(() => t.remove(), kind === 'bad' ? 9000 : 4500);
+  setTimeout(() => t.remove(), kind === 'bad' ? 6000 : 4500);
 }
 let rejectTimer = 0;
 function showReject(msg, count) {

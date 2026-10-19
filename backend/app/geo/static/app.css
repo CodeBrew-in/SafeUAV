@@ -137,3 +137,4 @@ label.f input, label.f select { font: inherit; padding: 4px 6px; border: 1px sol
 #mapctl button[aria-pressed=true] { background: #1d5fd1; color: #fff; }
 #downloads { flex-wrap: wrap; margin-bottom: 8px; }
 .attrib { margin-left: auto; color: var(--muted); font-size: 11px; }
+@media (max-width: 1000px) { #legend { display: none; } }

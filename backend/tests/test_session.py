@@ -629,18 +629,44 @@ def test_advance_turns_real_time_into_ticks_at_the_session_speed():
 
 # --- found by hand: "land at <not a pad>", "don't return home", friendly offline error -----------------
 
-@pytest.mark.parametrize("text", ["land at neeram hamll", "land and stop at neeram hall", "please land on the Neeram Hall"])
-def test_land_at_a_place_that_is_not_a_pad_is_explained_and_not_added_as_a_target(text):
+def _no_ai():
     class Boom:
         def ask(self, *a, **k):
             raise AssertionError("AI must not be called")
-    s = sess(Boom())
+    return Boom()
+
+
+def test_exact_land_at_a_non_pad_is_explained_without_the_ai():
+    s = sess(_no_ai())
     _fly(s)
     before = s.desired.targets
-    s.handle(text)
-    assert s.desired.targets == before and s.phase == "FLYING"
+    s.handle("land and stop at neeram hall")
+    assert s.desired.targets == before and not s.safety_pending
     assert any("not a landing pad" in c["text"] for c in s.chat if c["who"] == "system")
-    assert not s.safety_pending
+
+
+def test_the_ai_reads_a_misspelt_place_in_a_landing_order():
+    s = sess(FakeLLM(reply(["Neeram Hall"])))
+    _fly(s)
+    before = s.desired.targets
+    s.handle("land at neeram haul")                       # the spelling is the AI's job
+    assert s.desired.targets == before and not s.safety_pending
+    assert any("Neeram Hall is not a landing pad" in c["text"] for c in s.chat if c["who"] == "system")
+    s2 = sess(FakeLLM(reply(["Fete Area"])))
+    _fly(s2)
+    s2.handle("land at fate areea")
+    assert s2.safety_pending                                # understood: it is a pad, the landing is under way
+    run_ticks(s2, 900)
+    assert s2.phase == "WAITING"
+
+
+def test_offline_a_close_spelling_still_works_for_a_landing_order():
+    s = sess(FakeLLM(error="URLError: refused"))
+    _fly(s)
+    before = s.desired.targets
+    s.handle("land at neeram hamll")
+    assert s.desired.targets == before
+    assert any("not a landing pad" in c["text"] for c in s.chat if c["who"] == "system")
 
 
 @pytest.mark.parametrize("text", ["dont return home", "don't return to base", "do not go back home", "go to the library and stop there"])
@@ -657,3 +683,46 @@ def test_offline_ai_gives_a_friendly_message_not_a_stack_trace():
     s.handle("make it so")
     last = [c for c in s.chat if c["who"] == "ai"][-1]["text"]
     assert "offline" in last and "WinError" not in last and "URLError" not in last
+
+
+def test_end_mission_drops_the_targets_not_reached():
+    s = sess()
+    s.edit("target_add", LIB)
+    s.edit("target_add", "Venture Lab")
+    s.start()
+    run_ticks(s, 10)
+    s.end_mission()
+    run_ticks(s, 600)
+    assert s.phase == "DONE" and s.desired.targets == ()          # nothing was reached, so nothing is kept
+    s.edit("target_add", DIR)
+    assert s.desired.targets == (DIR,)                             # the next order stands on its own
+
+
+def test_divert_puts_the_new_stop_first_in_both_the_ai_and_the_basic_parser():
+    s = sess(mode="classic")
+    s.edit("target_add", LIB)
+    s.edit("target_add", DIR)
+    s.handle("divert to venture lab")
+    assert s.desired.targets == (VL, LIB, DIR)
+    s2 = sess(FakeLLM(reply([LIB, DIR, VL])))
+    s2.edit("target_add", LIB)
+    s2.edit("target_add", DIR)
+    s2.handle("divert to venture lab")
+    assert s2.desired.targets == (VL, LIB, DIR)
+    s3 = sess(mode="classic")
+    s3.edit("target_add", LIB)
+    s3.handle("also inspect venture lab")                  # no divert word: it is added at the end
+    assert s3.desired.targets == (LIB, VL)
+
+
+def test_end_mission_keeps_only_reached_targets_in_the_list():
+    s = sess()
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 600)
+    assert s.phase == "DONE"
+    s.edit("target_add", DIR)
+    run_ticks(s, 10)
+    s.end_mission()
+    run_ticks(s, 600)
+    assert s.phase == "DONE" and DIR not in s.desired.targets
