@@ -221,7 +221,7 @@ def main() -> None:
         pass
 
     DOC.write_text("\n".join(out) + "\n", encoding="utf-8", newline="\n")
-    print("\n".join(out))
+    print("\n".join(out).encode("ascii", "replace").decode())  # Windows console is not UTF-8
 
 
 def _wind_plot(wind, speeds):
