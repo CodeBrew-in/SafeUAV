@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+from .basemap import build_basemap
 from .flight import AVOID_BUFFER
 from .llm import gemini_key
 from .session import MODELS, MODES, SPEEDS, Session, SessionError
@@ -164,6 +165,8 @@ def make_handler(app: App):
                 return self._deny(403, "bad token")
             if path == "/api/map":
                 return self._json(app.map_payload())
+            if path == "/api/basemap":
+                return self._json(build_basemap())
             if path == "/api/health":
                 return self._json(app.health())
             if path == "/api/state":
@@ -237,7 +240,8 @@ def make_handler(app: App):
                 if not isinstance(op, str):
                     return self._deny(400, "missing op")
                 return self._json({"ok": True, "message": s.edit(op, body.get("place"), body.get("value"))})
-            simple = {"/api/start": s.start, "/api/pause": s.pause, "/api/resume": s.resume, "/api/reset": s.reset}
+            simple = {"/api/start": s.start, "/api/pause": s.pause, "/api/resume": s.resume, "/api/reset": s.reset,
+                      "/api/end": s.end_mission}
             if path in simple:
                 simple[path]()
                 return self._json({"ok": True})

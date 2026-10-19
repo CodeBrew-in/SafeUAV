@@ -3,201 +3,87 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>SafeUAV Campus</title>
-<style>
-  :root {
-    --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2433; --muted: #667085; --line: #d9dde5;
-    --place: #e3e7ee; --place-line: #b8c0cc; --jail: #d92d20; --avoid: #f79009; --pad: #12b76a;
-    --route: #2e6be6; --track: #101828; --direct: #d92d20; --accent: #2e6be6;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #0f1320; --panel: #171c2b; --ink: #e6e9f0; --muted: #98a2b3; --line: #2a3145;
-      --place: #232a3d; --place-line: #3a4460; --track: #e6e9f0; --route: #6d9bff; --accent: #6d9bff;
-    }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; }
-  .wrap { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 12px; padding: 12px; height: 100vh; }
-  @media (max-width: 900px) { .wrap { grid-template-columns: 1fr; height: auto; } }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
-  #mapcard { position: relative; min-height: 420px; }
-  canvas { width: 100%; height: 100%; display: block; }
-  .side { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
-  h1 { font-size: 16px; margin: 0 0 6px; }
-  .row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
-  label { color: var(--muted); font-size: 12px; }
-  select, input, button { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; }
-  button { cursor: pointer; }
-  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .badge { font-weight: 600; padding: 2px 8px; border-radius: 99px; background: var(--place); }
-  .badge.CRUISE, .badge.ESCAPE { background: #d1e9ff; color: #1849a9; }
-  .badge.TO_PAD, .badge.LANDED_WAIT { background: #fef0c7; color: #93370d; }
-  .badge.DONE { background: #d1fadf; color: #05603a; }
-  .badge.EMERGENCY, .badge.CRASHED, .badge.GROUNDED_NEEDS_PICKUP { background: #fee4e2; color: #912018; }
-  .bar { height: 8px; background: var(--place); border-radius: 4px; overflow: hidden; flex: 1; min-width: 80px; }
-  .bar > div { height: 100%; background: var(--pad); }
-  #chat { flex: 1; overflow-y: auto; min-height: 160px; display: flex; flex-direction: column; gap: 6px; }
-  .msg { padding: 6px 8px; border-radius: 8px; max-width: 95%; word-wrap: break-word; }
-  .msg.operator { align-self: flex-end; background: var(--accent); color: #fff; }
-  .msg.ai { background: var(--place); }
-  .msg.system { background: transparent; border: 1px dashed var(--line); font-size: 12px; color: var(--muted); }
-  .msg.system.bad { color: var(--jail); border-color: var(--jail); }
-  .msg small { display: block; opacity: .75; font-size: 11px; }
-  pre.spec { margin: 4px 0 0; font-size: 11px; white-space: pre-wrap; }
-  #log { max-height: 140px; overflow-y: auto; font: 11px/1.35 ui-monospace, Consolas, monospace; color: var(--muted); }
-  form { display: flex; gap: 6px; }
-  form input { flex: 1; }
-  .legend { position: absolute; left: 14px; bottom: 12px; font-size: 11px; color: var(--muted); background: var(--panel); padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line); }
-  .legend i { display: inline-block; width: 10px; height: 10px; margin: 0 3px 0 8px; vertical-align: -1px; }
-</style>
+<meta name="token" content="__TOKEN__">
+<title>SafeUAV Console</title>
+<link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<div class="wrap">
-  <div class="card" id="mapcard">
-    <canvas id="map"></canvas>
-    <div class="legend"><i style="background:var(--jail)"></i>no-fly (permanent)<i style="background:var(--avoid)"></i>avoid (operator)<i style="background:var(--pad)"></i>landing pad<i style="background:var(--route)"></i>planned<i style="background:var(--track)"></i>flown<i style="background:var(--direct)"></i>AI-direct</div>
-  </div>
-  <div class="side">
-    <div class="card">
-      <h1>SafeUAV · Thapar campus</h1>
+<header id="top">
+  <div class="brand"><span class="logo">&#9650;</span> SafeUAV <small id="ver"></small></div>
+  <div id="phase" class="badge">DRAFT</div>
+  <div class="grow"></div>
+  <div class="tag">SIMULATION ONLY</div>
+</header>
+
+<main>
+  <section id="mapwrap">
+    <canvas id="map" tabindex="0" aria-label="Campus map"></canvas>
+    <div id="banner"><span id="banner-main">Add a target, then press Start</span><span id="banner-sub"></span></div>
+    <div id="toasts"></div>
+    <div id="reject" class="hidden"></div>
+    <div id="replan" class="hidden"></div>
+    <div id="stale" class="hidden"></div>
+    <div id="card" class="hidden"></div>
+    <div id="mapctl">
+      <button id="zin" title="Zoom in">+</button>
+      <button id="zout" title="Zoom out">&minus;</button>
+      <button id="fit" title="Fit campus">Fit</button>
+      <button id="follow" title="Follow the drone" aria-pressed="false">Follow</button>
+    </div>
+    <div id="scalebar"><div id="scalebar-line"></div><span id="scalebar-txt"></span></div>
+    <div id="north">N</div>
+    <div id="directnote" class="hidden">AI-direct mode: no shield, no animation. The route the AI wrote is drawn in red.</div>
+    <div id="legend">
+      <span><i class="sw nofly"></i>no-fly (permanent)</span>
+      <span><i class="sw avoid"></i>restricted by you</span>
+      <span><i class="sw pad"></i>landing pad</span>
+      <span><i class="sw route"></i>planned route</span>
+      <span><i class="sw trail"></i>flown</span>
+    </div>
+  </section>
+
+  <aside id="side">
+    <div id="controls" class="panel">
       <div class="row">
-        <label>Mode</label>
-        <select id="mode"><option value="ours">Ours (AI → spec → shield)</option><option value="classic">Classic (no AI)</option><option value="direct">AI-direct (no shield)</option></select>
-        <label>Model</label><select id="model"></select>
+        <button id="start" class="primary big">Start</button>
+        <button id="pause" class="big">Pause</button>
+        <button id="reset" class="big">Reset</button>
       </div>
-      <div class="row" style="margin-top:6px">
-        <label>Battery Wh</label><input id="cap" type="number" value="40" min="5" max="80" style="width:60px">
-        <label>Clock</label><input id="clock" value="10:00" style="width:60px">
-        <label><input id="monitor" type="checkbox" checked> runtime monitor</label>
-        <button id="reset" class="primary">Reset</button>
+      <div class="row">
+        <span class="lbl">Speed</span>
+        <div id="speeds" class="seg"></div>
+        <div class="grow"></div>
+        <button id="rtb" class="warn small" title="Fly back to base (works without the AI)">Return now</button>
+        <button id="land" class="warn small" title="Land on the nearest pad (works without the AI)">Land now</button>
+        <button id="endm" class="small" title="Land and finish this mission. The drone then waits for a new order. Works without the AI.">End mission</button>
       </div>
-      <div class="row" style="margin-top:6px">
-        <label>Real wind</label><input id="wind" type="range" min="0" max="9" step="0.5" value="3"><span id="windv">3 m/s</span>
-        <select id="winddir"><option value="270">from W</option><option value="90">from E</option><option value="0">from N</option><option value="180">from S</option></select>
+      <div class="row">
+        <div class="bar" title="Battery; the mark is the reserve the drone never uses"><div id="batt"></div><div class="reserve"></div></div>
+        <span id="battv" class="mono"></span>
+        <span id="clk" class="mono"></span>
       </div>
-      <div class="row" style="margin-top:6px" id="scen"></div>
+      <div id="shield" class="mono"></div>
     </div>
-    <div class="card">
-      <div class="row"><span class="badge" id="state">PREFLIGHT</span><span id="clk"></span><div class="bar"><div id="batt"></div></div><span id="battv"></span></div>
-      <div id="specv" style="font-size:12px;color:var(--muted);margin-top:4px"></div>
-    </div>
-    <div class="card" style="display:flex;flex-direction:column;flex:1;min-height:0">
+
+    <nav id="tabs" class="tabs">
+      <button data-tab="mission" class="on">Mission</button>
+      <button data-tab="chat">Chat</button>
+      <button data-tab="log">Log</button>
+    </nav>
+
+    <div id="tab-mission" class="panel tab"></div>
+    <div id="tab-chat" class="panel tab hidden">
       <div id="chat"></div>
-      <form id="f"><input id="txt" placeholder="Order or change, e.g. 'Inspect the library, avoid E Hostel until 5pm'" autocomplete="off"><button class="primary">Send</button></form>
-      <div class="row" style="margin-top:4px"><button type="button" data-q="return now">Return now</button><button type="button" data-q="land now">Land now</button><span id="busy" style="color:var(--muted);font-size:12px"></span></div>
+      <div id="thinking" class="hidden"></div>
+      <div id="presets"></div>
+      <form id="chatform"><input id="chatin" placeholder="Type an order or a change…" autocomplete="off" maxlength="2000"><button class="primary">Send</button></form>
     </div>
-    <div class="card"><div id="log"></div></div>
-  </div>
-</div>
-<script>
-const TOKEN = "__TOKEN__";
-const $ = id => document.getElementById(id);
-let MAP = null, ST = null, chatN = 0;
-const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-
-async function api(path, body) {
-  const r = await fetch(path, body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
-  return r.json();
-}
-
-function view() {
-  const c = $('map'), r = c.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
-  c.width = r.width * dpr; c.height = r.height * dpr;
-  const [x0, y0, x1, y1] = MAP.fence, pad = 10;
-  const s = Math.min((r.width - 2 * pad) / (x1 - x0), (r.height - 2 * pad) / (y1 - y0));
-  const ox = pad + ((r.width - 2 * pad) - s * (x1 - x0)) / 2, oy = pad + ((r.height - 2 * pad) - s * (y1 - y0)) / 2;
-  return {ctx: c.getContext('2d'), dpr, s, P: p => [ox + (p[0] - x0) * s, oy + (y1 - p[1]) * s]};
-}
-
-function poly(ctx, P, pts, fill, stroke, w = 1) {
-  ctx.beginPath(); pts.forEach((p, i) => { const q = P(p); i ? ctx.lineTo(...q) : ctx.moveTo(...q); }); ctx.closePath();
-  if (fill) { ctx.fillStyle = fill; ctx.fill(); } if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = w; ctx.stroke(); }
-}
-function line(ctx, P, pts, color, w, dash) {
-  if (!pts || pts.length < 2) return;
-  ctx.beginPath(); ctx.setLineDash(dash || []); pts.forEach((p, i) => { const q = P(p); i ? ctx.lineTo(...q) : ctx.moveTo(...q); });
-  ctx.strokeStyle = color; ctx.lineWidth = w; ctx.stroke(); ctx.setLineDash([]);
-}
-
-function draw() {
-  if (!MAP) return;
-  const {ctx, dpr, s, P} = view();
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, 9999, 9999);
-  const [x0, y0, x1, y1] = MAP.fence;
-  poly(ctx, P, [[x0, y0], [x1, y0], [x1, y1], [x0, y1]], null, css('--line'), 2);
-  for (const p of MAP.places) poly(ctx, P, p.poly, css('--place'), css('--place-line'));
-  for (const z of MAP.no_fly) {
-    ctx.globalAlpha = .25; poly(ctx, P, z.poly, css('--jail'), null); ctx.globalAlpha = 1;
-    poly(ctx, P, z.poly, null, css('--jail'), Math.max(2, z.buffer * s));
-  }
-  if (ST) for (const z of ST.avoid) {
-    ctx.globalAlpha = .3; poly(ctx, P, z.poly, css('--avoid'), null); ctx.globalAlpha = 1;
-    poly(ctx, P, z.poly, null, css('--avoid'), Math.max(2, z.buffer * s));
-  }
-  ctx.font = '10px system-ui'; ctx.fillStyle = css('--muted'); ctx.textAlign = 'center';
-  for (const p of MAP.places) { const q = P(p.center); ctx.fillText(p.name.length > 22 ? p.name.slice(0, 20) + '…' : p.name, q[0], q[1] + 3); }
-  for (const [n, p] of Object.entries(MAP.pads)) {
-    const q = P(p); ctx.fillStyle = css('--pad'); ctx.fillRect(q[0] - 5, q[1] - 5, 10, 10);
-    ctx.fillStyle = css('--ink'); ctx.fillText(n === 'Football Ground' ? 'BASE' : 'pad', q[0], q[1] - 8);
-  }
-  if (!ST) return;
-  if (ST.direct && ST.direct.route) line(ctx, P, ST.direct.route, css('--direct'), 2, [6, 4]);
-  line(ctx, P, ST.route, css('--route'), 2, [5, 4]);
-  line(ctx, P, ST.track, css('--track'), 2);
-  const q = P(ST.pos);
-  ctx.beginPath(); ctx.arc(q[0], q[1], 6, 0, 7); ctx.fillStyle = css('--accent'); ctx.fill();
-  ctx.lineWidth = 2; ctx.strokeStyle = '#fff'; ctx.stroke();
-}
-
-function esc(t) { return String(t).replace(/[&<>]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;'}[c])); }
-function specText(sp) {
-  if (!sp) return '';
-  const av = sp.avoid.map(a => `${a.zone}${a.from || a.to ? ` (${a.from || 'now'}–${a.to || '∞'})` : ''}`);
-  return `targets: ${sp.targets.join(' → ') || '—'}${av.length ? ' · avoid: ' + av.join(', ') : ''} · ${sp.stay_at_end ? 'stay at last place' : 'return to base'}`;
-}
-
-async function poll() {
-  try {
-    ST = await api('/api/state?since=' + chatN);
-    $('state').textContent = ST.state; $('state').className = 'badge ' + ST.state;
-    $('clk').textContent = ST.clock + ' · t=' + Math.round(ST.t) + 's';
-    $('batt').style.width = Math.max(0, ST.battery_pct) + '%';
-    $('batt').style.background = ST.battery_pct < 20 ? css('--jail') : css('--pad');
-    $('battv').textContent = ST.battery_wh.toFixed(1) + ' Wh';
-    $('specv').textContent = specText(ST.spec);
-    $('busy').textContent = ST.busy ? 'AI is thinking…' : '';
-    if (ST.chat_total < chatN) { $('chat').innerHTML = ''; chatN = 0; }
-    for (const m of ST.chat) {
-      const d = document.createElement('div'); d.className = `msg ${m.who} ${m.level || ''}`;
-      d.innerHTML = `<small>${m.who} · ${m.clock}${m.status ? ' · ' + m.status : ''}${m.latency_ms ? ' · ' + (m.latency_ms / 1000).toFixed(1) + ' s' : ''}</small>${esc(m.text)}` +
-        (m.spec ? `<pre class="spec">${esc(specText(m.spec))}</pre>` : '');
-      $('chat').appendChild(d); $('chat').scrollTop = 1e9;
-    }
-    chatN += ST.chat.length;
-    $('log').innerHTML = ST.audit.slice().reverse().map(e => `${e.clock} [${e.state}] ${esc(e.kind)}: ${esc(e.msg)}`).join('<br>');
-    draw();
-  } catch (e) { $('busy').textContent = 'server not reachable'; }
-  setTimeout(poll, 250);
-}
-
-async function init() {
-  MAP = await api('/api/map');
-  $('model').innerHTML = MAP.models.map(m => `<option>${m}</option>`).join('');
-  $('scen').innerHTML = '<label>Demo</label>' + MAP.scenarios.map(n => `<button type="button">${n}</button>`).join('');
-  $('scen').querySelectorAll('button').forEach(b => b.onclick = () => { chatN = 0; $('chat').innerHTML = ''; api('/api/scenario', {name: b.textContent}); });
-  $('f').onsubmit = e => { e.preventDefault(); const t = $('txt').value.trim(); if (t) { api('/api/chat', {text: t}); $('txt').value = ''; } };
-  document.querySelectorAll('[data-q]').forEach(b => b.onclick = () => api('/api/chat', {text: b.dataset.q}));
-  $('reset').onclick = () => { chatN = 0; $('chat').innerHTML = '';
-    api('/api/reset', {model: $('model').value, mode: $('mode').value, capacity: +$('cap').value, clock: $('clock').value,
-      monitor: $('monitor').checked, wind_speed: +$('wind').value, wind_dir: +$('winddir').value}); };
-  const w = () => { $('windv').textContent = $('wind').value + ' m/s'; api('/api/wind', {speed: +$('wind').value, dir: +$('winddir').value}); };
-  $('wind').oninput = w; $('winddir').onchange = w;
-  $('model').onchange = $('mode').onchange = $('reset').onclick;
-  window.onresize = draw;
-  poll();
-}
-init();
-</script>
+    <div id="tab-log" class="panel tab hidden">
+      <div id="downloads" class="row"></div>
+      <div id="log" class="mono"></div>
+    </div>
+  </aside>
+</main>
+<script src="/static/app.js"></script>
 </body>
 </html>

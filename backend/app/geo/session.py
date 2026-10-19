@@ -16,6 +16,7 @@ a worker thread; the simulation keeps ticking (or holds, see `wait_for_ai`).
 from __future__ import annotations
 
 import dataclasses
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ DEFAULT_SPEED = 2
 MODELS = ["gemini-3.5-flash-lite", "qwen2.5:7b", "qwen2.5:3b"]
 MODES = ("ours", "classic", "direct")
 MAX_AVOID = 20
+END_WORDS = re.compile(r"^\s*(please\s+)?(end|finish|stop|cancel)\s+(the\s+|this\s+)?(mission|flight)\b", re.I)
 MAX_TARGETS = 10
 AI_DEADLINE_S = {"gemini": 30.0, "ollama": 60.0}
 FORECAST = Wind(3, 270)  # what the planner is told; the real wind may differ
@@ -122,6 +124,7 @@ class Session:
         self.started = False
         self.paused = False
         self.resume_submit = False     # an edit made while paused, applied on resume
+        self.end_after_land = False    # 'End mission' while airborne: land first, then finish
         self._audit_seen = 0
         self._rebuild()
 
@@ -214,14 +217,21 @@ class Session:
         return p
 
     def _editable(self) -> None:
-        if self.phase in ("DONE", "GROUNDED", "CRASHED"):
+        if self.phase in ("GROUNDED", "CRASHED"):
             raise SessionError("This flight has ended. Press Reset to start another.")
+
+    def working_spec(self) -> MissionSpec:
+        """The mission edits apply to. After a completed mission the finished targets are dropped (a new
+        order starts a new leg from where the drone landed); restrictions and the return setting stay."""
+        if self.started and self.ctl.state == "DONE":
+            return MissionSpec((), self.desired.avoid, self.desired.return_to_base)
+        return self.desired
 
     def edit(self, op: str, place: str | None = None, value: bool | None = None) -> str:
         """Click edits. Returns a short confirmation for the operator."""
         with self.lock:
             self._editable()
-            cur = self.desired
+            cur = self.working_spec()
             if op == "clear":
                 if self.started:
                     raise SessionError("Can't clear a mission in flight.")
@@ -259,11 +269,15 @@ class Session:
     def _commit(self, new: MissionSpec, *, source: str, text: str) -> None:
         """Validate and apply a new desired mission. Before Start only the draft changes."""
         if self.started:
+            new_leg = self.ctl.state == "DONE"
             chk = validate_spec(new, self.campus, now_min=self.ctl.clock(),
                                 horizon_min=horizon_min(self.cfg.capacity), position=self.ctl.pos,
-                                visited=frozenset(self.ctl.visited))
+                                visited=frozenset() if new_leg else frozenset(self.ctl.visited))
             if not chk.ok:
                 raise SessionError("; ".join(chk.errors))
+            if new_leg:
+                self.ctl.reopen()   # landed and idle: take the new order from here
+            self.end_after_land = False
             self.desired = new
             if self.paused:
                 self.resume_submit = True      # "queued: applies on resume"
@@ -321,7 +335,7 @@ class Session:
             self.gen += 1
             self.epoch += 1
             self.token = 0
-            self.started = self.paused = self.resume_submit = False
+            self.started = self.paused = self.resume_submit = self.end_after_land = False
             self.desired = self.draft
             self.chat, self.direct = [], None
             self._rebuild()
@@ -333,6 +347,24 @@ class Session:
                 raise SessionError("Nothing is flying.")
             self.paused = False
             self.ctl.submit(Command(kind, None, f"operator: {kind} now"))
+
+    def end_mission(self) -> None:
+        """The operator ends the mission: land on the nearest pad if airborne, then finish (DONE).
+        A finished drone stays on the ground and accepts a new order. Works without the AI."""
+        with self.lock:
+            if not self.started:
+                raise SessionError("There is no mission to end.")
+            st = self.ctl.state
+            if st in FLYING:
+                self.paused = False
+                self.end_after_land = True
+                self.ctl.submit(Command("land", None, "operator: end mission"))
+            elif st == "LANDED_WAIT":
+                self.ctl._set_state("DONE", "mission ended by the operator")
+            elif st == "DONE":
+                raise SessionError("The mission is already complete.")
+            else:
+                raise SessionError("This flight has ended. Press Reset to start another.")
 
     # --- simulation tick ------------------------------------------------------------------------
     def tick(self) -> None:
@@ -346,6 +378,12 @@ class Session:
                 if e["kind"] in ("order_rejected", "replan_failed"):
                     self.say("system", e["msg"], level="bad")
             self._audit_seen = len(ctl.audit)
+            if self.end_after_land:
+                if ctl.state == "LANDED_WAIT":
+                    ctl._set_state("DONE", "mission ended by the operator")
+                    self.end_after_land = False
+                elif ctl.state in ("DONE", "GROUNDED_NEEDS_PICKUP", "CRASHED"):
+                    self.end_after_land = False
 
     # --- chat -----------------------------------------------------------------------------------
     def handle(self, text: str) -> None:
@@ -353,13 +391,22 @@ class Session:
         text = text.strip()[:2000]
         if not text:
             return
+        if len(text) <= 60 and END_WORDS.match(text):
+            with self.lock:
+                self.say("operator", text)
+                self.end_mission()
+                self.say("ai", "Ending the mission: landing, then finishing. (handled without the AI)", status="keyword")
+            return
         with self.lock:
             if self.token:
                 raise SessionError("Still working on your previous message.")
+            self._editable()   # a finished flight takes no orders: Reset first
             gen = self.gen
             self.token = token = int(time.monotonic() * 1e6) or 1
-            base = self.desired
+            base = self.working_spec()
             visited = [self.campus.places[v].name for v in self.ctl.visited if v in self.campus.places]
+            if self.ctl.state == "DONE":
+                visited = []
             hh, cfg, campus = self.ctl.hhmm(), self.cfg, self.campus
             self.say("operator", text)
         try:
@@ -396,7 +443,7 @@ class Session:
                 self.say("ai", r.message, status="keyword")
                 return
             if kind == "ai" and r.status in ("applied",):
-                new = merge_reply(base, r.command.spec, self.desired)
+                new = merge_reply(base, r.command.spec, self.working_spec())
                 self._commit(new, source="chat", text=text)
                 self.say("ai", "Understood.", status="applied", spec=new.to_json(),
                          latency_ms=None if r.latency_ms is None else round(r.latency_ms))
@@ -421,7 +468,7 @@ class Session:
                 why = r.message if fallback else "I couldn't find a place name in that."
                 self.say("ai", why, status="error" if fallback else "clarify")
                 return
-            new = apply_parts(self.desired, targets, avoid, stay)
+            new = apply_parts(self.working_spec(), targets, avoid, stay)
             self._commit(new, source="chat", text=text)
             self.say("ai", ("AI unavailable: basic parser used. " if fallback else "Basic parser: ") + "Understood.",
                      status="fallback" if fallback else "applied", spec=new.to_json())

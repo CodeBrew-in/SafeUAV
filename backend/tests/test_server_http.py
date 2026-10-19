@@ -27,8 +27,17 @@ def srv():
     httpd.shutdown()
 
 
-def call(app, method, path, body=None, *, token=True, host=None, origin=None, ctype="application/json",
-         clen=None, raw=None):
+def call(app, method, path, body=None, **kw):
+    for attempt in (1, 2):
+        try:
+            return _call(app, method, path, body, **kw)
+        except ConnectionError:
+            if attempt == 2:
+                raise
+
+
+def _call(app, method, path, body=None, *, token=True, host=None, origin=None, ctype="application/json",
+          clen=None, raw=None):
     c = http.client.HTTPConnection("127.0.0.1", app.port, timeout=5)
     h = {"Host": host or f"127.0.0.1:{app.port}"}
     if token:

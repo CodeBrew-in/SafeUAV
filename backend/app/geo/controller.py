@@ -137,6 +137,14 @@ class Controller:
         self.track.append((self.t, *self.pos, self.state))
 
     # --- command handling --------------------------------------------------------------------------------
+    def reopen(self) -> None:
+        """After DONE the drone sits on the ground ready for a new mission, with the battery it has left.
+        Only used by the console; the benchmark never sends orders after DONE."""
+        if self.state == "DONE":
+            self.visited = []
+            self.landed_at = self.t
+            self._set_state("LANDED_WAIT", "ready for a new order")
+
     def _process_inbox(self) -> None:
         if not self.inbox or self.state in ("DONE", "GROUNDED_NEEDS_PICKUP", "CRASHED"):
             self.inbox.clear()

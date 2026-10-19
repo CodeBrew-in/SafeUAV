@@ -160,12 +160,38 @@ def test_click_in_flight_reroutes_and_bad_click_is_refused():
     assert [r.zone for r in s.desired.avoid] == [LIB]
 
 
-def test_edits_refused_after_the_flight_ends():
+def test_after_the_mission_the_drone_waits_and_takes_a_new_order():
     s = sess()
     s.edit("target_add", LIB)
     s.start()
     run_ticks(s, 600)
     assert s.phase == "DONE"
+    batt = s.ctl.energy
+    s.edit("target_add", DIR)                                  # a new leg from where it landed
+    assert s.desired.targets == (DIR,)                          # the finished target is not flown again
+    run_ticks(s, 600)
+    assert s.phase == "DONE" and s.ctl.visited == ["directorate"] and s.ctl.energy < batt
+
+
+def test_a_new_order_after_the_mission_that_needs_too_much_battery_is_refused_on_the_ground():
+    s = sess(capacity=20)
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 600)
+    assert s.phase == "DONE"
+    s.edit("target_add", "Thapar School of Liberal Art and Sciences")
+    s.edit("target_add", VL)
+    s.edit("target_add", HB)
+    run_ticks(s, 5)
+    assert s.ctl.state == "LANDED_WAIT"
+    assert any(c["who"] == "system" and c.get("level") == "bad" for c in s.chat)   # shield said why, drone stayed down
+
+
+def test_edits_refused_after_a_crash_or_pickup():
+    s = sess()
+    s.edit("target_add", LIB)
+    s.start()
+    s.ctl.state = "GROUNDED_NEEDS_PICKUP"
     with pytest.raises(SessionError, match="ended"):
         s.edit("target_add", DIR)
 
@@ -278,3 +304,66 @@ def test_delta_feed_offsets_and_epoch():
     d = s.snapshot(since)                                   # epoch changed: client must restart from zero
     assert d["reset"] and d["epoch"] == a["epoch"] + 1 and d["phase"] == "DRAFT"
     assert s.desired.targets == (LIB,)                      # reset keeps the draft
+
+
+def test_chat_after_a_completed_mission_starts_a_new_leg_and_after_pickup_is_refused():
+    s = sess(FakeLLM(reply([DIR])))
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 600)
+    assert s.phase == "DONE"
+    s.handle("go to the directorate")
+    assert s.desired.targets == (DIR,)
+    run_ticks(s, 600)
+    assert s.phase == "DONE" and s.ctl.visited == ["directorate"]
+
+    class Boom:
+        def ask(self, *a, **k):
+            raise AssertionError("AI must not be called")
+    s2 = sess(Boom())
+    s2.edit("target_add", LIB)
+    s2.start()
+    s2.ctl.state = "CRASHED"
+    with pytest.raises(SessionError, match="ended"):
+        s2.handle("go on")
+
+
+def test_end_mission_lands_then_finishes_and_a_new_order_still_works():
+    s = sess()
+    s.edit("target_add", DIR)
+    with pytest.raises(SessionError):
+        s.end_mission()                                      # nothing started yet
+    s.start()
+    run_ticks(s, 20)
+    s.end_mission()
+    run_ticks(s, 400)
+    assert s.phase == "DONE" and not s.end_after_land and DIR not in s.ctl.visited
+    s.edit("target_add", LIB)                                # the drone accepts a new order afterwards
+    run_ticks(s, 600)
+    assert s.ctl.visited == ["nava nalanda library".replace(" ", "")] and s.phase == "DONE"
+
+
+def test_end_mission_from_the_ground_and_by_chat_without_the_ai():
+    class Boom:
+        def ask(self, *a, **k):
+            raise AssertionError("AI must not be called")
+    s = sess(Boom())
+    s.edit("target_add", LIB)
+    s.start()
+    run_ticks(s, 15)
+    s.handle("end mission")
+    run_ticks(s, 400)
+    assert s.phase == "DONE" and any(c.get("status") == "keyword" for c in s.chat)
+    with pytest.raises(SessionError, match="already complete"):
+        s.end_mission()
+
+
+def test_a_new_order_cancels_a_pending_end():
+    s = sess()
+    s.edit("target_add", DIR)
+    s.start()
+    run_ticks(s, 10)
+    s.end_mission()
+    assert s.end_after_land
+    s.edit("target_add", LIB)
+    assert not s.end_after_land
